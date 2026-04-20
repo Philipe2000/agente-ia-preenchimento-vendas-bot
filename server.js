@@ -76,7 +76,14 @@ Converta a mensagem do usuário em JSON.
 A mensagem pode conter de 1 a 10 pedidos.
 Se não houver clareza suficiente, ainda tente extrair o máximo com cautela.
 
-Retorne SOMENTE JSON válido neste formato:
+Regras:
+- Se a quantidade vier em kg, preserve unidade = "kg".
+- Se a quantidade vier em g/gramas, preserve unidade = "g".
+- Se a forma de pagamento não for dita, retorne null.
+- Se o vencimento não for dito, retorne null.
+- Retorne SOMENTE JSON válido.
+
+Formato exato:
 
 {
   "pedidos": [
@@ -87,6 +94,8 @@ Retorne SOMENTE JSON válido neste formato:
       "unidade": "g|kg|un|null",
       "data_falada": "string ou null",
       "valor_falado": number ou null,
+      "forma_pagamento_falada": "PIX|Dinheiro à Vista|string|null",
+      "vencimento_falado": "string ou null",
       "observacoes": "string ou null"
     }
   ]
@@ -103,7 +112,8 @@ ${text}
       messages: [
         {
           role: "system",
-          content: "Você extrai pedidos comerciais e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
+          content:
+            "Você extrai pedidos comerciais e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
         },
         {
           role: "user",
@@ -149,7 +159,9 @@ function summarizeOrders(extraction) {
     const produto = p.produto_falado || "produto não identificado";
     const cliente = p.cliente_falado || "cliente não identificado";
     const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
-    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}`;
+    const forma = p.forma_pagamento_falada ? ` | forma: ${p.forma_pagamento_falada}` : "";
+    const venc = p.vencimento_falado ? ` | vencimento: ${p.vencimento_falado}` : "";
+    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}`;
   });
 
   return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
@@ -194,6 +206,53 @@ function getPendingBatch(chatId) {
 
 function clearPendingBatch(chatId) {
   pendingBatches.delete(String(chatId));
+}
+
+async function callGoogleAppsScript(payload) {
+  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
+    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
+  }
+
+  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
+    headers: {
+      "Content-Type": "application/json"
+    },
+    validateStatus: () => true
+  });
+
+  const contentType = resp.headers?.["content-type"] || "";
+  const bodyPreview =
+    typeof resp.data === "string"
+      ? resp.data.slice(0, 500)
+      : JSON.stringify(resp.data).slice(0, 500);
+
+  console.log("Apps Script status:", resp.status);
+  console.log("Apps Script content-type:", contentType);
+  console.log("Apps Script preview:", bodyPreview);
+
+  return resp.data;
+}
+
+function formatGoogleSuccessMessage(gsResp) {
+  const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
+  const okResults = resultados.filter(r => r && r.ok);
+
+  if (!okResults.length) {
+    return "Lote confirmado, mas não recebi detalhes dos itens preenchidos.";
+  }
+
+  const linhas = okResults.map((r, i) => {
+    const cliente = r.cliente_oficial || "cliente ?";
+    const produto = r.produto_oficial || "produto ?";
+    const qtdG = r.quantidade_gramas != null ? `${r.quantidade_gramas}g` : "?g";
+    const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
+    const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
+    const forma = r.forma_pagamento || "PIX";
+    const venc = r.vencimento || "?";
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${bloco} — ${forma} — venc. ${venc}`;
+  });
+
+  return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
 }
 
 app.get("/", (req, res) => {
@@ -246,19 +305,15 @@ app.post("/telegram/webhook", async (req, res) => {
       });
 
       clearPendingBatch(chatId);
-console.log("Resposta bruta do Apps Script:", gsResp);
 
-if (gsResp?.ok) {
-  await sendTelegramMessage(
-    chatId,
-    `Lote confirmado com sucesso.\n\nPedidos enviados ao Google com sucesso: ${pedidos.length}`
-  );
-} else {
-  await sendTelegramMessage(
-    chatId,
-    `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta recebida: ${JSON.stringify(gsResp)}`
-  );
-}
+      if (gsResp?.ok) {
+        await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
+      } else {
+        await sendTelegramMessage(
+          chatId,
+          `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
+        );
+      }
 
       return;
     }
@@ -307,7 +362,9 @@ if (gsResp?.ok) {
 
     await sendTelegramMessage(chatId, "Envie texto ou áudio para eu processar.");
   } catch (error) {
-    console.error("Erro no webhook:", error.response?.data || error.message || error);
+    console.error("Erro no webhook completo:", error);
+    console.error("Erro no webhook response data:", error.response?.data);
+    console.error("Erro no webhook message:", error.message);
 
     try {
       const update = req.body || {};
@@ -329,22 +386,3 @@ if (gsResp?.ok) {
 app.listen(PORT, () => {
   console.log(`Servidor online na porta ${PORT}`);
 });
-
-async function callGoogleAppsScript(payload) {
-  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
-    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
-  }
-
-  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
-    headers: {
-      "Content-Type": "application/json"
-    },
-    validateStatus: () => true
-  });
-
-  console.log("Status Apps Script:", resp.status);
-  console.log("Headers Apps Script:", resp.headers);
-  console.log("Body Apps Script:", resp.data);
-
-  return resp.data;
-}
