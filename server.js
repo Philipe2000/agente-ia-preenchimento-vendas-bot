@@ -504,6 +504,41 @@ function formatDuplicateMessage(gsResp) {
   ].join("\n");
 }
 
+async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pending) {
+  if (!pending || isConfirmationText(incomingText)) {
+    return false;
+  }
+
+  const correction = await interpretCorrectionFromText(incomingText, pending.extraction);
+
+  if (!correction?.is_correction) {
+    return false;
+  }
+
+  const applied = applyCorrectionToExtraction(pending.extraction, correction);
+
+  if (!applied.ok) {
+    await sendTelegramMessage(chatId, applied.message);
+    return true;
+  }
+
+  savePendingBatch(chatId, applied.extraction, {
+    ...(pending.meta || {}),
+    lastCorrectionText: incomingText,
+    lastCorrectionSource: sourceLabel,
+    duplicateAwaitingForce: false
+  });
+
+  const novoResumo = summarizeOrders(applied.extraction);
+
+  await sendTelegramMessage(
+    chatId,
+    `${sourceLabel === "audio" ? `Transcrição da correção:\n"${incomingText}"\n\n` : ""}${applied.message}\n\n${novoResumo}`
+  );
+
+  return true;
+}
+
 app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
@@ -579,29 +614,8 @@ app.post("/telegram/webhook", async (req, res) => {
     if (text) {
       const pending = getPendingBatch(chatId);
 
-      if (pending && !isConfirmationText(text)) {
-        const correction = await interpretCorrectionFromText(text, pending.extraction);
-
-        if (correction?.is_correction) {
-          const applied = applyCorrectionToExtraction(pending.extraction, correction);
-
-          if (applied.ok) {
-            savePendingBatch(chatId, applied.extraction, {
-              ...(pending.meta || {}),
-              lastCorrectionText: text,
-              duplicateAwaitingForce: false
-            });
-
-            const novoResumo = summarizeOrders(applied.extraction);
-
-            await sendTelegramMessage(chatId, `${applied.message}\n\n${novoResumo}`);
-            return;
-          }
-
-          await sendTelegramMessage(chatId, applied.message);
-          return;
-        }
-      }
+      const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
+      if (handledCorrection) return;
 
       const extraction = await extractOrdersFromText(text);
       const resumo = summarizeOrders(extraction);
@@ -628,6 +642,11 @@ app.post("/telegram/webhook", async (req, res) => {
         await sendTelegramMessage(chatId, "Não consegui transcrever esse áudio.");
         return;
       }
+
+      const pending = getPendingBatch(chatId);
+
+      const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
+      if (handledCorrection) return;
 
       const extraction = await extractOrdersFromText(transcription);
 
