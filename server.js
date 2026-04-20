@@ -10,6 +10,12 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
+/**
+ * Estado simples em memória para V1
+ * Depois podemos trocar por banco.
+ */
+const pendingBatches = new Map();
+
 function telegramApiUrl(method) {
   return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 }
@@ -122,6 +128,7 @@ ${text}
   content = String(content).trim();
 
   console.log("Resposta bruta da OpenAI extractOrdersFromText:", content);
+
   try {
     return JSON.parse(content);
   } catch (err) {
@@ -152,18 +159,45 @@ function summarizeOrders(extraction) {
   return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
 }
 
-async function callGoogleAppsScript(payload) {
-  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
-    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
-  }
+function normalizeText(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
-    headers: {
-      "Content-Type": "application/json"
-    }
+function isConfirmationText(text) {
+  const t = normalizeText(text);
+
+  return (
+    t === "sim" ||
+    t === "ok" ||
+    t === "certo" ||
+    t === "isso" ||
+    t === "confirmar" ||
+    t === "pode confirmar" ||
+    t === "confirme" ||
+    t === "confirmar sim" ||
+    t === "confirme tudo"
+  );
+}
+
+function savePendingBatch(chatId, extraction, meta = {}) {
+  pendingBatches.set(String(chatId), {
+    extraction,
+    meta,
+    createdAt: new Date().toISOString()
   });
+}
 
-  return resp.data;
+function getPendingBatch(chatId) {
+  return pendingBatches.get(String(chatId)) || null;
+}
+
+function clearPendingBatch(chatId) {
+  pendingBatches.delete(String(chatId));
 }
 
 app.get("/", (req, res) => {
@@ -194,13 +228,52 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const text = (msg.text || msg.caption || "").trim();
 
+    /**
+     * 1) Se vier texto de confirmação e houver lote pendente
+     */
+    if (text && isConfirmationText(text)) {
+      const pending = getPendingBatch(chatId);
+
+      if (!pending) {
+        await sendTelegramMessage(
+          chatId,
+          "Não encontrei nenhum lote pendente para confirmar."
+        );
+        return;
+      }
+
+      const pedidos = Array.isArray(pending.extraction?.pedidos)
+        ? pending.extraction.pedidos
+        : [];
+
+      clearPendingBatch(chatId);
+
+      await sendTelegramMessage(
+        chatId,
+        `Lote confirmado com sucesso.\n\nPedidos confirmados: ${pedidos.length}\n\nPróximo passo: vou ligar a resolução de cliente/produto e o preenchimento da planilha.`
+      );
+      return;
+    }
+
+    /**
+     * 2) Texto novo de pedido
+     */
     if (text) {
       const extraction = await extractOrdersFromText(text);
       const resumo = summarizeOrders(extraction);
+
+      savePendingBatch(chatId, extraction, {
+        source: "text",
+        originalText: text
+      });
+
       await sendTelegramMessage(chatId, resumo);
       return;
     }
 
+    /**
+     * 3) Áudio novo
+     */
     if (msg.voice || msg.audio) {
       await sendTelegramMessage(chatId, "Recebi seu áudio. Vou transcrever e analisar.");
 
@@ -215,6 +288,12 @@ app.post("/telegram/webhook", async (req, res) => {
       }
 
       const extraction = await extractOrdersFromText(transcription);
+
+      savePendingBatch(chatId, extraction, {
+        source: "audio",
+        transcription
+      });
+
       const resumo = summarizeOrders(extraction);
 
       await sendTelegramMessage(
