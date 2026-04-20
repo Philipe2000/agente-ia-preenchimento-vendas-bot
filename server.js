@@ -10,10 +10,6 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
-/**
- * Estado simples em memória para V1
- * Depois podemos trocar por banco.
- */
 const pendingBatches = new Map();
 
 function telegramApiUrl(method) {
@@ -228,9 +224,6 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const text = (msg.text || msg.caption || "").trim();
 
-    /**
-     * 1) Se vier texto de confirmação e houver lote pendente
-     */
     if (text && isConfirmationText(text)) {
       const pending = getPendingBatch(chatId);
 
@@ -246,31 +239,29 @@ app.post("/telegram/webhook", async (req, res) => {
         ? pending.extraction.pedidos
         : [];
 
+      const gsResp = await callGoogleAppsScript({
+        action: "preencher_lote_v1",
+        pedidos,
+        meta: pending.meta || {}
+      });
+
       clearPendingBatch(chatId);
 
-     const gsResp = await callGoogleAppsScript({
-  action: "preencher_lote_v1",
-  pedidos,
-  meta: pending.meta || {}
-});
+      if (gsResp?.ok) {
+        await sendTelegramMessage(
+          chatId,
+          `Lote confirmado com sucesso.\n\nPedidos enviados ao Google com sucesso: ${pedidos.length}`
+        );
+      } else {
+        await sendTelegramMessage(
+          chatId,
+          `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nErro: ${gsResp?.error || "desconhecido"}`
+        );
+      }
 
-clearPendingBatch(chatId);
+      return;
+    }
 
-if (gsResp?.ok) {
-  await sendTelegramMessage(
-    chatId,
-    `Lote confirmado com sucesso.\n\nPedidos enviados ao Google com sucesso: ${pedidos.length}`
-  );
-} else {
-  await sendTelegramMessage(
-    chatId,
-    `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nErro: ${gsResp?.error || "desconhecido"}`
-  );
-}
-
-    /**
-     * 2) Texto novo de pedido
-     */
     if (text) {
       const extraction = await extractOrdersFromText(text);
       const resumo = summarizeOrders(extraction);
@@ -284,9 +275,6 @@ if (gsResp?.ok) {
       return;
     }
 
-    /**
-     * 3) Áudio novo
-     */
     if (msg.voice || msg.audio) {
       await sendTelegramMessage(chatId, "Recebi seu áudio. Vou transcrever e analisar.");
 
@@ -340,7 +328,6 @@ if (gsResp?.ok) {
 app.listen(PORT, () => {
   console.log(`Servidor online na porta ${PORT}`);
 });
-
 
 async function callGoogleAppsScript(payload) {
   if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
