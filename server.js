@@ -153,6 +153,97 @@ ${text}
   }
 }
 
+async function interpretCorrectionFromText(text, pendingExtraction) {
+  const pedidos = Array.isArray(pendingExtraction?.pedidos)
+    ? pendingExtraction.pedidos
+    : [];
+
+  const prompt = `
+Você é um interpretador de correções de um lote de pedidos já extraído.
+
+Você receberá:
+1. a mensagem nova do usuário
+2. o lote atual em JSON
+
+Sua tarefa:
+- descobrir se a mensagem é uma correção do lote atual
+- se for, retornar a ação estruturada
+- se não for, retornar "is_correction": false
+
+Ações permitidas nesta V1.1:
+- alterar quantidade de um item
+- alterar cliente de um item
+- remover um item
+
+Retorne SOMENTE JSON válido neste formato:
+
+{
+  "is_correction": true ou false,
+  "action": "update_quantity|update_client|remove_item|null",
+  "item_index": number ou null,
+  "fields": {
+    "quantidade": number ou null,
+    "unidade": "g|kg|un|null",
+    "cliente_falado": "string ou null"
+  },
+  "motivo": "string"
+}
+
+Regras:
+- item_index é baseado em 1
+- se o usuário não disser item, e houver só 1 pedido, use item_index = 1
+- para "não, é 300g", tente entender como correção de quantidade
+- para "troca o cliente para Flávio", tente entender como correção de cliente
+- para "remove o item 2", use remove_item
+- se a mensagem parecer um pedido novo e não correção, retorne is_correction false
+
+Mensagem do usuário:
+${text}
+
+Lote atual:
+${JSON.stringify({ pedidos }, null, 2)}
+`.trim();
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "Você interpreta correções de lote e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0,
+      response_format: { type: "json_object" }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      }
+    }
+  );
+
+  const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
+
+  try {
+    return JSON.parse(content);
+  } catch (err) {
+    return {
+      is_correction: false,
+      action: null,
+      item_index: null,
+      fields: {},
+      motivo: "Falha ao interpretar correção"
+    };
+  }
+}
+
 function summarizeOrders(extraction) {
   const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
 
@@ -216,6 +307,71 @@ function getPendingBatch(chatId) {
 
 function clearPendingBatch(chatId) {
   pendingBatches.delete(String(chatId));
+}
+
+function cloneExtraction(extraction) {
+  return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
+}
+
+function applyCorrectionToExtraction(extraction, correction) {
+  const novo = cloneExtraction(extraction);
+  const pedidos = Array.isArray(novo.pedidos) ? novo.pedidos : [];
+  const idx = Number(correction?.item_index || 0) - 1;
+
+  if (idx < 0 || idx >= pedidos.length) {
+    return {
+      ok: false,
+      message: "Não consegui identificar qual item corrigir."
+    };
+  }
+
+  const item = pedidos[idx];
+  const action = correction?.action;
+
+  if (action === "update_quantity") {
+    if (correction?.fields?.quantidade == null) {
+      return { ok: false, message: "Não consegui entender a nova quantidade." };
+    }
+
+    item.quantidade = Number(correction.fields.quantidade);
+    item.unidade = correction?.fields?.unidade || item.unidade || "g";
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi a quantidade do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_client") {
+    const cliente = String(correction?.fields?.cliente_falado || "").trim();
+    if (!cliente) {
+      return { ok: false, message: "Não consegui entender o novo cliente." };
+    }
+
+    item.cliente_falado = cliente;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o cliente do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "remove_item") {
+    pedidos.splice(idx, 1);
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Removi o item ${idx + 1}.`
+    };
+  }
+
+  return {
+    ok: false,
+    message: "Não reconheci a ação de correção."
+  };
 }
 
 async function callGoogleAppsScript(payload) {
@@ -366,12 +522,42 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     if (text) {
+      const pending = getPendingBatch(chatId);
+
+      if (pending && !isConfirmationText(text)) {
+        const correction = await interpretCorrectionFromText(text, pending.extraction);
+
+        if (correction?.is_correction) {
+          const applied = applyCorrectionToExtraction(pending.extraction, correction);
+
+          if (applied.ok) {
+            savePendingBatch(chatId, applied.extraction, {
+              ...(pending.meta || {}),
+              lastCorrectionText: text,
+              duplicateAwaitingForce: false
+            });
+
+            const novoResumo = summarizeOrders(applied.extraction);
+
+            await sendTelegramMessage(
+              chatId,
+              `${applied.message}\n\n${novoResumo}`
+            );
+            return;
+          }
+
+          await sendTelegramMessage(chatId, applied.message);
+          return;
+        }
+      }
+
       const extraction = await extractOrdersFromText(text);
       const resumo = summarizeOrders(extraction);
 
       savePendingBatch(chatId, extraction, {
         source: "text",
-        originalText: text
+        originalText: text,
+        duplicateAwaitingForce: false
       });
 
       await sendTelegramMessage(chatId, resumo);
@@ -395,7 +581,8 @@ app.post("/telegram/webhook", async (req, res) => {
 
       savePendingBatch(chatId, extraction, {
         source: "audio",
-        transcription
+        transcription,
+        duplicateAwaitingForce: false
       });
 
       const resumo = summarizeOrders(extraction);
