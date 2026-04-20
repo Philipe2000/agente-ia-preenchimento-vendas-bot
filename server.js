@@ -234,8 +234,8 @@ async function callGoogleAppsScript(payload) {
 }
 
 function formatGoogleSuccessMessage(gsResp) {
-  const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
-  const okResults = resultados.filter(r => r && r.ok);
+  return `Lote confirmado.\n\nResposta bruta do Google:\n${JSON.stringify(gsResp).slice(0, 3500)}`;
+};
 
   if (!okResults.length) {
     return "Lote confirmado, mas não recebi detalhes dos itens preenchidos.";
