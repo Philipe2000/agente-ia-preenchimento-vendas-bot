@@ -1,5 +1,6 @@
 const express = require("express");
 const axios = require("axios");
+const FormData = require("form-data");
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -13,11 +14,153 @@ function telegramApiUrl(method) {
   return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 }
 
+function telegramFileUrl(filePath) {
+  return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+}
+
 async function sendTelegramMessage(chatId, text) {
   return axios.post(telegramApiUrl("sendMessage"), {
     chat_id: chatId,
     text
   });
+}
+
+async function getTelegramFile(fileId) {
+  const resp = await axios.get(telegramApiUrl("getFile"), {
+    params: { file_id: fileId }
+  });
+
+  if (!resp.data?.ok || !resp.data?.result?.file_path) {
+    throw new Error("Não foi possível obter o file_path do Telegram.");
+  }
+
+  return resp.data.result;
+}
+
+async function downloadTelegramFileBuffer(filePath) {
+  const resp = await axios.get(telegramFileUrl(filePath), {
+    responseType: "arraybuffer"
+  });
+
+  return Buffer.from(resp.data);
+}
+
+async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
+  const form = new FormData();
+  form.append("file", buffer, filename);
+  form.append("model", "gpt-4o-mini-transcribe");
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/audio/transcriptions",
+    form,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        ...form.getHeaders()
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    }
+  );
+
+  return resp.data?.text || "";
+}
+
+async function extractOrdersFromText(text) {
+  const prompt = `
+Você é um extrator de pedidos de vendas em português do Brasil.
+
+Converta a mensagem do usuário em JSON.
+A mensagem pode conter de 1 a 10 pedidos.
+Se não houver clareza suficiente, ainda tente extrair o máximo com cautela.
+
+Retorne SOMENTE JSON válido neste formato:
+
+{
+  "pedidos": [
+    {
+      "cliente_falado": "string ou null",
+      "produto_falado": "string ou null",
+      "quantidade": number ou null,
+      "unidade": "g|kg|un|null",
+      "data_falada": "string ou null",
+      "valor_falado": number ou null,
+      "observacoes": "string ou null"
+    }
+  ]
+}
+
+Mensagem:
+${text}
+`.trim();
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content: "Você extrai pedidos comerciais e responde apenas JSON válido."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      }
+    }
+  );
+
+  const content = resp.data?.choices?.[0]?.message?.content || "{}";
+
+  try {
+    return JSON.parse(content);
+  } catch (err) {
+    return {
+      pedidos: [],
+      erro_parse: true,
+      conteudo_bruto: content
+    };
+  }
+}
+
+function summarizeOrders(extraction) {
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
+
+  if (!pedidos.length) {
+    return "Não consegui extrair pedidos com segurança ainda.";
+  }
+
+  const linhas = pedidos.map((p, i) => {
+    const qtd = p.quantidade != null ? String(p.quantidade) : "?";
+    const unidade = p.unidade || "";
+    const produto = p.produto_falado || "produto não identificado";
+    const cliente = p.cliente_falado || "cliente não identificado";
+    const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
+    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}`;
+  });
+
+  return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
+}
+
+async function callGoogleAppsScript(payload) {
+  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
+    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
+  }
+
+  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
+    headers: {
+      "Content-Type": "application/json"
+    }
+  });
+
+  return resp.data;
 }
 
 app.get("/", (req, res) => {
@@ -41,36 +184,61 @@ app.post("/telegram/webhook", async (req, res) => {
   try {
     const update = req.body || {};
     const msg = update.message || update.edited_message;
-
     if (!msg) return;
 
-    const chatId = msg.chat && msg.chat.id;
-    const text = (msg.text || msg.caption || "").trim();
-
+    const chatId = msg.chat?.id;
     if (!chatId) return;
 
+    const text = (msg.text || msg.caption || "").trim();
+
     if (text) {
-      await sendTelegramMessage(
-        chatId,
-        `Recebi seu texto: "${text}"\n\nPróximo passo: vou ligar a IA e o preenchimento no Google Sheets.`
-      );
+      const extraction = await extractOrdersFromText(text);
+      const resumo = summarizeOrders(extraction);
+      await sendTelegramMessage(chatId, resumo);
       return;
     }
 
     if (msg.voice || msg.audio) {
+      await sendTelegramMessage(chatId, "Recebi seu áudio. Vou transcrever e analisar.");
+
+      const fileId = msg.voice?.file_id || msg.audio?.file_id;
+      const fileInfo = await getTelegramFile(fileId);
+      const audioBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+      const transcription = await transcribeAudioWithOpenAI(audioBuffer, "audio.ogg");
+
+      if (!transcription) {
+        await sendTelegramMessage(chatId, "Não consegui transcrever esse áudio.");
+        return;
+      }
+
+      const extraction = await extractOrdersFromText(transcription);
+      const resumo = summarizeOrders(extraction);
+
       await sendTelegramMessage(
         chatId,
-        "Recebi seu áudio. Próximo passo: vou ligar a transcrição com OpenAI."
+        `Transcrição:\n"${transcription}"\n\n${resumo}`
       );
       return;
     }
 
-    await sendTelegramMessage(
-      chatId,
-      "Envie texto ou áudio para eu processar."
-    );
+    await sendTelegramMessage(chatId, "Envie texto ou áudio para eu processar.");
   } catch (error) {
     console.error("Erro no webhook:", error.response?.data || error.message || error);
+
+    try {
+      const update = req.body || {};
+      const msg = update.message || update.edited_message;
+      const chatId = msg?.chat?.id;
+
+      if (chatId) {
+        await sendTelegramMessage(
+          chatId,
+          "Tive um erro ao processar sua mensagem."
+        );
+      }
+    } catch (err2) {
+      console.error("Erro ao enviar mensagem de falha:", err2.message || err2);
+    }
   }
 });
 
