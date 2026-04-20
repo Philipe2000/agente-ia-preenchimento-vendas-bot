@@ -246,18 +246,19 @@ app.post("/telegram/webhook", async (req, res) => {
       });
 
       clearPendingBatch(chatId);
+console.log("Resposta bruta do Apps Script:", gsResp);
 
-      if (gsResp?.ok) {
-        await sendTelegramMessage(
-          chatId,
-          `Lote confirmado com sucesso.\n\nPedidos enviados ao Google com sucesso: ${pedidos.length}`
-        );
-      } else {
-        await sendTelegramMessage(
-          chatId,
-          `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nErro: ${gsResp?.error || "desconhecido"}`
-        );
-      }
+if (gsResp?.ok) {
+  await sendTelegramMessage(
+    chatId,
+    `Lote confirmado com sucesso.\n\nPedidos enviados ao Google com sucesso: ${pedidos.length}`
+  );
+} else {
+  await sendTelegramMessage(
+    chatId,
+    `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta recebida: ${JSON.stringify(gsResp)}`
+  );
+}
 
       return;
     }
@@ -337,8 +338,13 @@ async function callGoogleAppsScript(payload) {
   const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
     headers: {
       "Content-Type": "application/json"
-    }
+    },
+    validateStatus: () => true
   });
+
+  console.log("Status Apps Script:", resp.status);
+  console.log("Headers Apps Script:", resp.headers);
+  console.log("Body Apps Script:", resp.data);
 
   return resp.data;
 }
