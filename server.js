@@ -197,7 +197,8 @@ function isConfirmationText(text) {
     t === "pode confirmar" ||
     t === "confirme" ||
     t === "confirmar sim" ||
-    t === "confirme tudo"
+    t === "confirme tudo" ||
+    t === "confirmar duplicata"
   );
 }
 
@@ -268,6 +269,27 @@ function formatGoogleSuccessMessage(gsResp) {
   return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
 }
 
+function formatDuplicateMessage(gsResp) {
+  const dup = Array.isArray(gsResp?.resultados)
+    ? gsResp.resultados.find((r) => r && r.possible_duplicate)
+    : null;
+
+  const primeira = dup && Array.isArray(dup.duplicatas) ? dup.duplicatas[0] : null;
+
+  return [
+    "Possível duplicata encontrada.",
+    "",
+    `Cliente: ${dup?.cliente_oficial || "?"}`,
+    `Produto: ${dup?.produto_oficial || "?"}`,
+    `Quantidade: ${dup?.quantidade_gramas || "?"}g`,
+    `Data: ${dup?.data_venda || "?"}`,
+    "",
+    `Registro já existente: ${primeira ? JSON.stringify(primeira) : "não detalhado"}`,
+    "",
+    "Se quiser lançar mesmo assim, responda: confirmar duplicata"
+  ].join("\n");
+}
+
 app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
@@ -311,17 +333,29 @@ app.post("/telegram/webhook", async (req, res) => {
         ? pending.extraction.pedidos
         : [];
 
+      const forceDuplicateConfirmed =
+        normalizeText(text) === "confirmar duplicata" ||
+        pending?.meta?.duplicateAwaitingForce === true;
+
       const gsResp = await callGoogleAppsScript({
         action: "preencher_lote_v1",
         pedidos,
-        meta: pending.meta || {}
+        meta: pending.meta || {},
+        force_duplicate_confirmed: forceDuplicateConfirmed
       });
 
-      clearPendingBatch(chatId);
-
       if (gsResp?.ok) {
+        clearPendingBatch(chatId);
         await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
+      } else if (gsResp?.possible_duplicate) {
+        savePendingBatch(chatId, pending.extraction, {
+          ...(pending.meta || {}),
+          duplicateAwaitingForce: true
+        });
+
+        await sendTelegramMessage(chatId, formatDuplicateMessage(gsResp));
       } else {
+        clearPendingBatch(chatId);
         await sendTelegramMessage(
           chatId,
           `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
