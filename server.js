@@ -255,11 +255,14 @@ function formatGoogleSuccessMessage(gsResp) {
     const produto = r.produto_oficial || "produto ?";
     const qtdG = r.quantidade_gramas != null ? `${r.quantidade_gramas}g` : "?g";
     const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
+    const valor = r.valor != null ? `R$ ${r.valor}` : "sem valor";
     const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
     const forma = r.forma_pagamento || "PIX";
     const venc = r.vencimento || "?";
+    const confianca =
+      r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
 
-    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${bloco} — ${forma} — venc. ${venc}`;
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco} — ${forma} — venc. ${venc}${confianca}`;
   });
 
   return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
