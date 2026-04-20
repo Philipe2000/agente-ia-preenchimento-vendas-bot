@@ -101,14 +101,15 @@ ${text}
       messages: [
         {
           role: "system",
-          content: "Você extrai pedidos comerciais e responde apenas JSON válido."
+          content: "Você extrai pedidos comerciais e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
         },
         {
           role: "user",
           content: prompt
         }
       ],
-      temperature: 0
+      temperature: 0,
+      response_format: { type: "json_object" }
     },
     {
       headers: {
@@ -117,8 +118,10 @@ ${text}
     }
   );
 
-  const content = resp.data?.choices?.[0]?.message?.content || "{}";
+  let content = resp.data?.choices?.[0]?.message?.content || "{}";
+  content = String(content).trim();
 
+  console.log("Resposta bruta da OpenAI extractOrdersFromText:", content);
   try {
     return JSON.parse(content);
   } catch (err) {
