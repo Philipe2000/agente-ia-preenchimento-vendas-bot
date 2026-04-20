@@ -248,12 +248,25 @@ app.post("/telegram/webhook", async (req, res) => {
 
       clearPendingBatch(chatId);
 
-      await sendTelegramMessage(
-        chatId,
-        `Lote confirmado com sucesso.\n\nPedidos confirmados: ${pedidos.length}\n\nPróximo passo: vou ligar a resolução de cliente/produto e o preenchimento da planilha.`
-      );
-      return;
-    }
+     const gsResp = await callGoogleAppsScript({
+  action: "preencher_lote_v1",
+  pedidos,
+  meta: pending.meta || {}
+});
+
+clearPendingBatch(chatId);
+
+if (gsResp?.ok) {
+  await sendTelegramMessage(
+    chatId,
+    `Lote confirmado com sucesso.\n\nPedidos enviados ao Google com sucesso: ${pedidos.length}`
+  );
+} else {
+  await sendTelegramMessage(
+    chatId,
+    `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nErro: ${gsResp?.error || "desconhecido"}`
+  );
+}
 
     /**
      * 2) Texto novo de pedido
@@ -327,3 +340,18 @@ app.post("/telegram/webhook", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor online na porta ${PORT}`);
 });
+
+
+async function callGoogleAppsScript(payload) {
+  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
+    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
+  }
+
+  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
+    headers: {
+      "Content-Type": "application/json"
+    }
+  });
+
+  return resp.data;
+}
