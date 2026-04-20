@@ -79,6 +79,13 @@ Se não houver clareza suficiente, ainda tente extrair o máximo com cautela.
 Regras:
 - Se a quantidade vier em kg, preserve unidade = "kg".
 - Se a quantidade vier em g/gramas, preserve unidade = "g".
+- Se o usuário disser um valor por extenso, converta para número.
+  Exemplo: "dois mil duzentos e cinquenta" => 2250
+- Se o usuário disser vencimento por data, preserve em texto.
+  Exemplos:
+  - "vencimento dia 10 de maio"
+  - "para 15 de abril"
+  - "vence em 20/04/2026"
 - Se a forma de pagamento não for dita, retorne null.
 - Se o vencimento não for dito, retorne null.
 - Retorne SOMENTE JSON válido.
@@ -161,8 +168,9 @@ function summarizeOrders(extraction) {
     const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
     const forma = p.forma_pagamento_falada ? ` | forma: ${p.forma_pagamento_falada}` : "";
     const venc = p.vencimento_falado ? ` | vencimento: ${p.vencimento_falado}` : "";
+    const valor = p.valor_falado != null ? ` | valor: ${p.valor_falado}` : "";
 
-    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}`;
+    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}${valor}`;
   });
 
   return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
