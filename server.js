@@ -82,10 +82,6 @@ Regras:
 - Se o usuário disser um valor por extenso, converta para número.
   Exemplo: "dois mil duzentos e cinquenta" => 2250
 - Se o usuário disser vencimento por data, preserve em texto.
-  Exemplos:
-  - "vencimento dia 10 de maio"
-  - "para 15 de abril"
-  - "vence em 20/04/2026"
 - Se a forma de pagamento não for dita, retorne null.
 - Se o vencimento não for dito, retorne null.
 - Retorne SOMENTE JSON válido.
@@ -137,26 +133,157 @@ ${text}
     }
   );
 
-  let content = resp.data?.choices?.[0]?.message?.content || "{}";
-  content = String(content).trim();
-
+  const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
   console.log("Resposta bruta da OpenAI extractOrdersFromText:", content);
 
   try {
     return JSON.parse(content);
   } catch (err) {
-    return {
-      pedidos: [],
-      erro_parse: true,
-      conteudo_bruto: content
-    };
+    return { pedidos: [], erro_parse: true, conteudo_bruto: content };
   }
 }
 
+function summarizeOrders(extraction) {
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
+
+  if (!pedidos.length) {
+    return "Não consegui extrair pedidos com segurança ainda.";
+  }
+
+  const linhas = pedidos.map((p, i) => {
+    const qtd = p.quantidade != null ? String(p.quantidade) : "?";
+    const unidade = p.unidade || "";
+    const produto = p.produto_falado || "produto não identificado";
+    const cliente = p.cliente_falado || "cliente não identificado";
+    const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
+    const forma = p.forma_pagamento_falada ? ` | forma: ${p.forma_pagamento_falada}` : "";
+    const venc = p.vencimento_falado ? ` | vencimento: ${p.vencimento_falado}` : "";
+    const valor = p.valor_falado != null ? ` | valor: ${p.valor_falado}` : "";
+
+    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}${valor}`;
+  });
+
+  return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
+}
+
+function normalizeText(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isConfirmationText(text) {
+  const t = normalizeText(text);
+
+  return (
+    t === "sim" ||
+    t === "ok" ||
+    t === "certo" ||
+    t === "isso" ||
+    t === "confirmar" ||
+    t === "pode confirmar" ||
+    t === "confirme" ||
+    t === "confirmar sim" ||
+    t === "confirme tudo" ||
+    t === "confirmar duplicata"
+  );
+}
+
+function savePendingBatch(chatId, extraction, meta = {}) {
+  pendingBatches.set(String(chatId), {
+    extraction,
+    meta,
+    createdAt: new Date().toISOString()
+  });
+}
+
+function getPendingBatch(chatId) {
+  return pendingBatches.get(String(chatId)) || null;
+}
+
+function clearPendingBatch(chatId) {
+  pendingBatches.delete(String(chatId));
+}
+
+function cloneExtraction(extraction) {
+  return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
+}
+
+function parseSimpleCorrection(text, pendingExtraction) {
+  const pedidos = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos : [];
+  if (!pedidos.length) return null;
+
+  const normalized = normalizeText(text);
+  const itemIndexMatch = normalized.match(/\bitem\s+(\d+)\b/);
+  const itemIndex = itemIndexMatch ? Number(itemIndexMatch[1]) : (pedidos.length === 1 ? 1 : null);
+
+  const qtyMatch = normalized.match(/\b(\d+(?:[.,]\d+)?)\s*(kg|g)\b/);
+  if (qtyMatch && itemIndex) {
+    return {
+      is_correction: true,
+      action: "update_quantity",
+      item_index: itemIndex,
+      fields: {
+        quantidade: Number(qtyMatch[1].replace(",", ".")),
+        unidade: qtyMatch[2],
+        cliente_falado: null
+      },
+      motivo: "fallback regex quantidade"
+    };
+  }
+
+  const removeMatch =
+    normalized.match(/\bremove(?:r)?\s+o\s+item\s+(\d+)\b/) ||
+    normalized.match(/\bapaga(?:r)?\s+o\s+item\s+(\d+)\b/) ||
+    normalized.match(/\bexclui(?:r)?\s+o\s+item\s+(\d+)\b/);
+
+  if (removeMatch) {
+    return {
+      is_correction: true,
+      action: "remove_item",
+      item_index: Number(removeMatch[1]),
+      fields: {
+        quantidade: null,
+        unidade: null,
+        cliente_falado: null
+      },
+      motivo: "fallback regex remove item"
+    };
+  }
+
+  const clientMatch =
+    normalized.match(/\btroca\s+o\s+cliente\s+para\s+(.+)$/) ||
+    normalized.match(/\bo\s+cliente\s+e\s+(.+)$/) ||
+    normalized.match(/\bcliente\s+(.+)$/);
+
+  if (clientMatch && itemIndex) {
+    const cliente = String(clientMatch[1] || "").trim();
+    if (cliente) {
+      return {
+        is_correction: true,
+        action: "update_client",
+        item_index: itemIndex,
+        fields: {
+          quantidade: null,
+          unidade: null,
+          cliente_falado: cliente
+        },
+        motivo: "fallback regex cliente"
+      };
+    }
+  }
+
+  return null;
+}
+
 async function interpretCorrectionFromText(text, pendingExtraction) {
-  const pedidos = Array.isArray(pendingExtraction?.pedidos)
-    ? pendingExtraction.pedidos
-    : [];
+  const fallback = parseSimpleCorrection(text, pendingExtraction);
+  if (fallback) return fallback;
+
+  const pedidos = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos : [];
 
   const prompt = `
 Você é um interpretador de correções de um lote de pedidos já extraído.
@@ -242,75 +369,6 @@ ${JSON.stringify({ pedidos }, null, 2)}
       motivo: "Falha ao interpretar correção"
     };
   }
-}
-
-function summarizeOrders(extraction) {
-  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
-
-  if (!pedidos.length) {
-    return "Não consegui extrair pedidos com segurança ainda.";
-  }
-
-  const linhas = pedidos.map((p, i) => {
-    const qtd = p.quantidade != null ? String(p.quantidade) : "?";
-    const unidade = p.unidade || "";
-    const produto = p.produto_falado || "produto não identificado";
-    const cliente = p.cliente_falado || "cliente não identificado";
-    const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
-    const forma = p.forma_pagamento_falada ? ` | forma: ${p.forma_pagamento_falada}` : "";
-    const venc = p.vencimento_falado ? ` | vencimento: ${p.vencimento_falado}` : "";
-    const valor = p.valor_falado != null ? ` | valor: ${p.valor_falado}` : "";
-
-    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}${valor}`;
-  });
-
-  return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
-}
-
-function normalizeText(text) {
-  return String(text || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isConfirmationText(text) {
-  const t = normalizeText(text);
-
-  return (
-    t === "sim" ||
-    t === "ok" ||
-    t === "certo" ||
-    t === "isso" ||
-    t === "confirmar" ||
-    t === "pode confirmar" ||
-    t === "confirme" ||
-    t === "confirmar sim" ||
-    t === "confirme tudo" ||
-    t === "confirmar duplicata"
-  );
-}
-
-function savePendingBatch(chatId, extraction, meta = {}) {
-  pendingBatches.set(String(chatId), {
-    extraction,
-    meta,
-    createdAt: new Date().toISOString()
-  });
-}
-
-function getPendingBatch(chatId) {
-  return pendingBatches.get(String(chatId)) || null;
-}
-
-function clearPendingBatch(chatId) {
-  pendingBatches.delete(String(chatId));
-}
-
-function cloneExtraction(extraction) {
-  return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
 }
 
 function applyCorrectionToExtraction(extraction, correction) {
@@ -478,10 +536,7 @@ app.post("/telegram/webhook", async (req, res) => {
       const pending = getPendingBatch(chatId);
 
       if (!pending) {
-        await sendTelegramMessage(
-          chatId,
-          "Não encontrei nenhum lote pendente para confirmar."
-        );
+        await sendTelegramMessage(chatId, "Não encontrei nenhum lote pendente para confirmar.");
         return;
       }
 
@@ -539,10 +594,7 @@ app.post("/telegram/webhook", async (req, res) => {
 
             const novoResumo = summarizeOrders(applied.extraction);
 
-            await sendTelegramMessage(
-              chatId,
-              `${applied.message}\n\n${novoResumo}`
-            );
+            await sendTelegramMessage(chatId, `${applied.message}\n\n${novoResumo}`);
             return;
           }
 
@@ -587,10 +639,7 @@ app.post("/telegram/webhook", async (req, res) => {
 
       const resumo = summarizeOrders(extraction);
 
-      await sendTelegramMessage(
-        chatId,
-        `Transcrição:\n"${transcription}"\n\n${resumo}`
-      );
+      await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"\n\n${resumo}`);
       return;
     }
 
@@ -606,10 +655,7 @@ app.post("/telegram/webhook", async (req, res) => {
       const chatId = msg?.chat?.id;
 
       if (chatId) {
-        await sendTelegramMessage(
-          chatId,
-          "Tive um erro ao processar sua mensagem."
-        );
+        await sendTelegramMessage(chatId, "Tive um erro ao processar sua mensagem.");
       }
     } catch (err2) {
       console.error("Erro ao enviar mensagem de falha:", err2.message || err2);
