@@ -161,6 +161,7 @@ function summarizeOrders(extraction) {
     const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
     const forma = p.forma_pagamento_falada ? ` | forma: ${p.forma_pagamento_falada}` : "";
     const venc = p.vencimento_falado ? ` | vencimento: ${p.vencimento_falado}` : "";
+
     return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}`;
   });
 
@@ -234,11 +235,11 @@ async function callGoogleAppsScript(payload) {
 }
 
 function formatGoogleSuccessMessage(gsResp) {
-  return `Lote confirmado.\n\nResposta bruta do Google:\n${JSON.stringify(gsResp).slice(0, 3500)}`;
-};
+  const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
+  const okResults = resultados.filter((r) => r && r.ok);
 
   if (!okResults.length) {
-    return "Lote confirmado, mas não recebi detalhes dos itens preenchidos.";
+    return `Lote confirmado.\n\nResposta bruta do Google:\n${JSON.stringify(gsResp).slice(0, 3500)}`;
   }
 
   const linhas = okResults.map((r, i) => {
@@ -249,6 +250,7 @@ function formatGoogleSuccessMessage(gsResp) {
     const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
     const forma = r.forma_pagamento || "PIX";
     const venc = r.vencimento || "?";
+
     return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${bloco} — ${forma} — venc. ${venc}`;
   });
 
