@@ -11,6 +11,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
 const pendingBatches = new Map();
+const pendingActions = new Map();
 
 function telegramApiUrl(method) {
   return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
@@ -50,20 +51,14 @@ async function downloadTelegramFileBuffer(filePath) {
 async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   const form = new FormData();
   form.append("file", buffer, filename);
-
-  // Modelo mais forte de transcrição
   form.append("model", "gpt-4o-transcribe");
-
-  // Idioma esperado
   form.append("language", "pt");
-
-  // Vocabulário útil do seu negócio
   form.append(
     "prompt",
     [
       "Transcrição em português do Brasil.",
       "Nomes frequentes de clientes:",
-      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia.",
+      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Valdeisa, Valdeisa Patos.",
       "Produtos frequentes:",
       "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
       "Medidas frequentes:",
@@ -97,52 +92,6 @@ function normalizeText(text) {
     .trim();
 }
 
-function isConfirmationText(text) {
-  const t = normalizeText(text);
-
-  return (
-    t === "sim" ||
-    t === "ok" ||
-    t === "certo" ||
-    t === "isso" ||
-    t === "confirmar" ||
-    t === "pode confirmar" ||
-    t === "confirme" ||
-    t === "confirmar sim" ||
-    t === "confirme tudo" ||
-    t === "confirmar duplicata"
-  );
-}
-
-function isCancelText(text) {
-  const t = normalizeText(text);
-
-  return (
-    t === "cancelar" ||
-    t === "cancelar lote" ||
-    t === "limpar" ||
-    t === "limpar lote" ||
-    t === "comecar de novo" ||
-    t === "recomecar" ||
-    t === "apagar lote"
-  );
-}
-
-function looksLikeFreshOrderMessage(text) {
-  const t = normalizeText(text);
-
-  return (
-    t.includes("comprou") ||
-    t.includes("pedido") ||
-    /\b\d+(?:[.,]\d+)?\s*(g|kg)\b/.test(t) ||
-    /\br\$\s*\d+/.test(t) ||
-    t.includes("valor") ||
-    t.includes("vence") ||
-    t.includes("vencimento") ||
-    t.includes("no dia")
-  );
-}
-
 function cloneExtraction(extraction) {
   return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
 }
@@ -161,6 +110,18 @@ function getPendingBatch(chatId) {
 
 function clearPendingBatch(chatId) {
   pendingBatches.delete(String(chatId));
+}
+
+function savePendingAction(chatId, action) {
+  pendingActions.set(String(chatId), action);
+}
+
+function getPendingAction(chatId) {
+  return pendingActions.get(String(chatId)) || null;
+}
+
+function clearPendingAction(chatId) {
+  pendingActions.delete(String(chatId));
 }
 
 function parseBrazilianNumber(str) {
@@ -184,9 +145,7 @@ function normalizeDateValue(rawText) {
   const t = normalizeText(original);
   const now = new Date();
 
-  if (t === "hoje") {
-    return formatDateToIso(now);
-  }
+  if (t === "hoje") return formatDateToIso(now);
 
   if (t === "ontem") {
     const d = new Date(now);
@@ -201,9 +160,7 @@ function normalizeDateValue(rawText) {
   }
 
   let m = original.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (m) {
-    return `${m[1]}-${m[2]}-${m[3]}`;
-  }
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
 
   m = original.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (m) {
@@ -320,9 +277,7 @@ function inferGlobalContextFromText(text) {
     }
   }
 
-  const clientePattern =
-    original.match(/^\s*([A-Za-zÀ-ÿ'’\-]+)\s+comprou\b/i);
-
+  const clientePattern = original.match(/^\s*([A-Za-zÀ-ÿ'’\-]+)\s+comprou\b/i);
   if (clientePattern) {
     context.cliente_falado = String(clientePattern[1] || "").trim() || null;
   }
@@ -381,16 +336,13 @@ Regras:
 - Se a quantidade vier em kg, preserve unidade = "kg".
 - Se a quantidade vier em g/gramas, preserve unidade = "g".
 - Se o usuário disser um valor por extenso, converta para número.
-  Exemplo: "dois mil duzentos e cinquenta" => 2250
 - Se o usuário disser data da compra como "18/04", preserve "18/04".
 - Se o usuário disser "ontem", "antes de ontem" ou "hoje", preserve esse texto em data_falada.
 - Se a forma de pagamento não for dita, retorne null.
 - Se o vencimento não for dito, retorne null.
-- Se um mesmo contexto geral de data, cliente, vencimento ou pagamento parecer valer para vários pedidos, ainda assim extraia pedido por pedido e preserve o máximo possível.
 - Retorne SOMENTE JSON válido.
 
 Formato exato:
-
 {
   "pedidos": [
     {
@@ -421,18 +373,13 @@ ${text}
           content:
             "Você extrai pedidos comerciais e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
         },
-        {
-          role: "user",
-          content: prompt
-        }
+        { role: "user", content: prompt }
       ],
       temperature: 0,
       response_format: { type: "json_object" }
     },
     {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
     }
   );
 
@@ -468,6 +415,197 @@ function summarizeOrders(extraction) {
   });
 
   return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
+}
+
+async function callGoogleAppsScript(payload) {
+  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
+    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
+  }
+
+  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
+    headers: { "Content-Type": "application/json" },
+    validateStatus: () => true
+  });
+
+  const contentType = resp.headers?.["content-type"] || "";
+  const bodyPreview =
+    typeof resp.data === "string"
+      ? resp.data.slice(0, 500)
+      : JSON.stringify(resp.data).slice(0, 500);
+
+  console.log("Apps Script status:", resp.status);
+  console.log("Apps Script content-type:", contentType);
+  console.log("Apps Script preview:", bodyPreview);
+
+  return resp.data;
+}
+
+async function previewGoogleAppsScript(payload) {
+  return callGoogleAppsScript({
+    action: "preview_lote_v1",
+    pedidos: payload.pedidos || []
+  });
+}
+
+function formatOfficialPreviewMessage(previewResp) {
+  const resultados = Array.isArray(previewResp?.resultados) ? previewResp.resultados : [];
+  const okResults = resultados.filter((r) => r && r.ok);
+
+  if (!okResults.length) {
+    return "Não consegui montar a prévia oficial ainda.";
+  }
+
+  const linhas = okResults.map((r, i) => {
+    const cliente = r.cliente_oficial || r.cliente_falado || "cliente ?";
+    const produto = r.produto_oficial || r.produto_falado || "produto ?";
+    const qtd = r.quantidade_gramas != null ? `${r.quantidade_gramas}g` : "?g";
+    const data = r.data_venda ? ` | data: ${r.data_venda}` : "";
+    const valor = r.valor != null ? ` | valor: ${r.valor}` : "";
+    const forma = r.forma_pagamento ? ` | forma: ${r.forma_pagamento}` : "";
+    const venc = r.vencimento ? ` | vencimento: ${r.vencimento}` : "";
+    const sugestao = r.sugestao_cliente ? ` | ${r.sugestao_cliente}` : "";
+
+    return `${i + 1}. ${qtd} de ${produto} para ${cliente}${data}${valor}${forma}${venc}${sugestao}`;
+  });
+
+  return `Entendi estes pedidos oficiais:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
+}
+
+function formatGoogleSuccessMessage(gsResp) {
+  const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
+  const okResults = resultados.filter((r) => r && r.ok);
+
+  if (!okResults.length) {
+    return `Lote confirmado.\n\nResposta bruta do Google:\n${JSON.stringify(gsResp).slice(0, 3500)}`;
+  }
+
+  const linhas = okResults.map((r, i) => {
+    const cliente = r.cliente_oficial || "cliente ?";
+    const produto = r.produto_oficial || "produto ?";
+    const qtdG = r.quantidade_gramas != null ? `${r.quantidade_gramas}g` : "?g";
+    const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
+    const valor = r.valor != null ? `R$ ${r.valor}` : "sem valor";
+    const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
+    const linha = r.linha_item != null ? ` | linha ${r.linha_item}` : "";
+    const forma = r.forma_pagamento || "PIX";
+    const venc = r.vencimento || "?";
+    const confCli =
+      r.confianca_cliente != null ? ` | conf. cliente ${r.confianca_cliente}` : "";
+    const confProd =
+      r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
+
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco}${linha} — ${forma} — venc. ${venc}${confCli}${confProd}`;
+  });
+
+  return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
+}
+
+function formatDuplicateMessage(gsResp) {
+  const dup = Array.isArray(gsResp?.resultados)
+    ? gsResp.resultados.find((r) => r && r.possible_duplicate)
+    : null;
+
+  const primeira = dup && Array.isArray(dup.duplicatas) ? dup.duplicatas[0] : null;
+
+  return [
+    "Possível duplicata encontrada.",
+    "",
+    `Cliente: ${dup?.cliente_oficial || "?"}`,
+    `Produto: ${dup?.produto_oficial || "?"}`,
+    `Quantidade: ${dup?.quantidade_gramas || "?"}g`,
+    `Data: ${dup?.data_venda || "?"}`,
+    "",
+    `Registro já existente: ${primeira ? JSON.stringify(primeira) : "não detalhado"}`,
+    "",
+    "Se quiser lançar mesmo assim, confirme."
+  ].join("\n");
+}
+
+async function interpretDeleteIntent(text) {
+  const t = normalizeText(text);
+
+  const quick =
+    t.includes("remover o ultimo preenchimento") ||
+    t.includes("apagar o ultimo preenchimento")
+      ? { is_delete: true, mode: "last", indices: [] }
+      : t.includes("remover todos") || t.includes("apagar todos")
+        ? { is_delete: true, mode: "all", indices: [] }
+        : null;
+
+  if (quick) return quick;
+
+  const matches = [...t.matchAll(/\bpreenchimento\s+(\d+)\b/g)]
+    .map((m) => Number(m[1]))
+    .filter(Boolean);
+
+  if (matches.length) {
+    return { is_delete: true, mode: "specific", indices: matches };
+  }
+
+  const prompt = `
+Interprete a intenção do usuário sobre remoção de preenchimentos de uma planilha de vendas.
+
+Responda SOMENTE JSON válido neste formato:
+{
+  "is_delete": true ou false,
+  "mode": "last|specific|all|null",
+  "indices": [number]
+}
+
+Mensagem:
+${text}
+`.trim();
+
+  try {
+    const resp = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4.1-mini",
+        messages: [
+          {
+            role: "system",
+            content: "Você responde apenas JSON válido."
+          },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" }
+      },
+      {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+      }
+    );
+
+    return JSON.parse(String(resp.data?.choices?.[0]?.message?.content || "{}"));
+  } catch {
+    return { is_delete: false };
+  }
+}
+
+async function executeDeleteAction(chatId, action) {
+  const resp = await callGoogleAppsScript({
+    action: "delete_preenchimentos_v1",
+    mode: action.mode,
+    indices: action.indices || []
+  });
+
+  if (!resp?.ok) {
+    await sendTelegramMessage(
+      chatId,
+      `Não consegui remover os preenchimentos.\n\nResposta: ${JSON.stringify(resp).slice(0, 3000)}`
+    );
+    return;
+  }
+
+  const resultados = Array.isArray(resp.resultados) ? resp.resultados : [];
+  const linhas = resultados.map((r, i) => {
+    return `${i + 1}. bloco ${r.base_row} — cliente: ${r.cliente || "?"} — produtos: ${(r.produtos || []).join(", ") || "?"}`;
+  });
+
+  await sendTelegramMessage(
+    chatId,
+    `Remoção concluída com sucesso.\n\n${linhas.join("\n")}`
+  );
 }
 
 function parseSimpleCorrection(text, pendingExtraction) {
@@ -539,9 +677,7 @@ function parseSimpleCorrection(text, pendingExtraction) {
         is_correction: true,
         action: "update_client",
         item_index: itemIndex,
-        fields: {
-          cliente_falado: cliente
-        },
+        fields: { cliente_falado: cliente },
         motivo: "fallback regex cliente"
       };
     }
@@ -557,9 +693,7 @@ function parseSimpleCorrection(text, pendingExtraction) {
       is_correction: true,
       action: "update_value",
       item_index: itemIndex,
-      fields: {
-        valor_falado: parseBrazilianNumber(valueMatch[1])
-      },
+      fields: { valor_falado: parseBrazilianNumber(valueMatch[1]) },
       motivo: "fallback regex valor"
     };
   }
@@ -570,9 +704,7 @@ function parseSimpleCorrection(text, pendingExtraction) {
       is_correction: true,
       action: "update_payment",
       item_index: itemIndex,
-      fields: {
-        forma_pagamento_falada: payment
-      },
+      fields: { forma_pagamento_falada: payment },
       motivo: "fallback regex pagamento"
     };
   }
@@ -587,9 +719,7 @@ function parseSimpleCorrection(text, pendingExtraction) {
       is_correction: true,
       action: "update_due_date",
       item_index: itemIndex,
-      fields: {
-        vencimento_falado: dueDate
-      },
+      fields: { vencimento_falado: dueDate },
       motivo: "fallback regex vencimento"
     };
   }
@@ -606,9 +736,7 @@ function parseSimpleCorrection(text, pendingExtraction) {
         is_correction: true,
         action: "update_product",
         item_index: itemIndex,
-        fields: {
-          produto_falado: produto
-        },
+        fields: { produto_falado: produto },
         motivo: "fallback regex produto"
       };
     }
@@ -682,28 +810,7 @@ async function interpretCorrectionFromText(text, pendingExtraction) {
   const prompt = `
 Você é um interpretador de correções de um lote de pedidos já extraído.
 
-Você receberá:
-1. a mensagem nova do usuário
-2. o lote atual em JSON
-
-Sua tarefa:
-- descobrir se a mensagem é uma correção do lote atual
-- se for, retornar a ação estruturada
-- se não for, retornar "is_correction": false
-
-Ações permitidas:
-- alterar quantidade de um item
-- alterar cliente de um item
-- remover um item
-- alterar produto de um item
-- alterar valor de um item
-- alterar vencimento de um item
-- alterar forma de pagamento de um item
-- substituir vários campos de um item
-- substituir o lote inteiro
-
-Retorne SOMENTE JSON válido neste formato:
-
+Responda SOMENTE JSON válido neste formato:
 {
   "is_correction": true ou false,
   "action": "update_quantity|update_client|remove_item|update_product|update_value|update_due_date|update_payment|replace_item_fields|replace_batch|null",
@@ -721,14 +828,6 @@ Retorne SOMENTE JSON válido neste formato:
   "motivo": "string"
 }
 
-Regras:
-- item_index é baseado em 1
-- se o usuário não disser item, e houver só 1 pedido, use item_index = 1
-- se a mensagem reescrever o lote inteiro, use replace_batch
-- se a mensagem reescrever só um item, use replace_item_fields
-- se a mensagem parecer um pedido novo e não correção, retorne is_correction false
-- para data_falada e vencimento_falado, preserve o texto que conseguir
-
 Mensagem do usuário:
 ${text}
 
@@ -741,23 +840,14 @@ ${JSON.stringify({ pedidos }, null, 2)}
     {
       model: "gpt-4.1-mini",
       messages: [
-        {
-          role: "system",
-          content:
-            "Você interpreta correções de lote e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
+        { role: "system", content: "Você responde apenas JSON válido." },
+        { role: "user", content: prompt }
       ],
       temperature: 0,
       response_format: { type: "json_object" }
     },
     {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
     }
   );
 
@@ -833,11 +923,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
     item.quantidade = Number(correction.fields.quantidade);
     item.unidade = correction?.fields?.unidade || item.unidade || "g";
 
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi a quantidade do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi a quantidade do item ${idx + 1}.` };
   }
 
   if (action === "update_client") {
@@ -847,12 +933,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
     }
 
     item.cliente_falado = cliente;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o cliente do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi o cliente do item ${idx + 1}.` };
   }
 
   if (action === "update_product") {
@@ -862,12 +943,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
     }
 
     item.produto_falado = produto;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o produto do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi o produto do item ${idx + 1}.` };
   }
 
   if (action === "update_value") {
@@ -877,12 +953,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
     }
 
     item.valor_falado = Number(valor);
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o valor do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi o valor do item ${idx + 1}.` };
   }
 
   if (action === "update_due_date") {
@@ -892,12 +963,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
     }
 
     item.vencimento_falado = vencimento;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o vencimento do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi o vencimento do item ${idx + 1}.` };
   }
 
   if (action === "update_payment") {
@@ -907,22 +973,12 @@ async function applyCorrectionToExtraction(extraction, correction) {
     }
 
     item.forma_pagamento_falada = forma;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi a forma de pagamento do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi a forma de pagamento do item ${idx + 1}.` };
   }
 
   if (action === "remove_item") {
     pedidos.splice(idx, 1);
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Removi o item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Removi o item ${idx + 1}.` };
   }
 
   if (action === "replace_item_fields") {
@@ -963,81 +1019,105 @@ async function applyCorrectionToExtraction(extraction, correction) {
   };
 }
 
-async function callGoogleAppsScript(payload) {
-  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
-    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
-  }
-
-  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
-    headers: {
-      "Content-Type": "application/json"
-    },
-    validateStatus: () => true
-  });
-
-  const contentType = resp.headers?.["content-type"] || "";
-  const bodyPreview =
-    typeof resp.data === "string"
-      ? resp.data.slice(0, 500)
-      : JSON.stringify(resp.data).slice(0, 500);
-
-  console.log("Apps Script status:", resp.status);
-  console.log("Apps Script content-type:", contentType);
-  console.log("Apps Script preview:", bodyPreview);
-
-  return resp.data;
+function quickConfirmationText(text) {
+  const t = normalizeText(text);
+  return (
+    t === "sim" ||
+    t === "ok" ||
+    t === "okay" ||
+    t === "certo" ||
+    t === "isso" ||
+    t === "confirmado" ||
+    t === "confirmar" ||
+    t === "pode confirmar" ||
+    t === "confirme" ||
+    t === "pode lancar" ||
+    t === "lanca" ||
+    t === "manda" ||
+    t === "pode seguir" ||
+    t === "fechado" ||
+    t === "show" ||
+    t === "beleza" ||
+    t === "blz" ||
+    t === "joia" ||
+    t === "joinha" ||
+    t === "👍" ||
+    t === "✅" ||
+    t === "confirmar duplicata"
+  );
 }
 
-function formatGoogleSuccessMessage(gsResp) {
-  const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
-  const okResults = resultados.filter((r) => r && r.ok);
-
-  if (!okResults.length) {
-    return `Lote confirmado.\n\nResposta bruta do Google:\n${JSON.stringify(gsResp).slice(0, 3500)}`;
-  }
-
-  const linhas = okResults.map((r, i) => {
-    const cliente = r.cliente_oficial || "cliente ?";
-    const produto = r.produto_oficial || "produto ?";
-    const qtdG = r.quantidade_gramas != null ? `${r.quantidade_gramas}g` : "?g";
-    const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
-    const valor = r.valor != null ? `R$ ${r.valor}` : "sem valor";
-    const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
-    const linha = r.linha_item != null ? ` | linha ${r.linha_item}` : "";
-    const forma = r.forma_pagamento || "PIX";
-    const venc = r.vencimento || "?";
-    const confianca =
-      r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
-
-    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco}${linha} — ${forma} — venc. ${venc}${confianca}`;
-  });
-
-  return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
+function quickCancelText(text) {
+  const t = normalizeText(text);
+  return isCancelText(t) || t === "nao" || t === "não" || t === "para" || t === "cancela";
 }
 
-function formatDuplicateMessage(gsResp) {
-  const dup = Array.isArray(gsResp?.resultados)
-    ? gsResp.resultados.find((r) => r && r.possible_duplicate)
-    : null;
+async function interpretUserControlIntent(text, hasPendingBatch, hasPendingAction) {
+  if (!text) return { intent: "none", confidence: 0 };
 
-  const primeira = dup && Array.isArray(dup.duplicatas) ? dup.duplicatas[0] : null;
+  if (quickConfirmationText(text)) {
+    return { intent: "confirm", confidence: 1 };
+  }
 
-  return [
-    "Possível duplicata encontrada.",
-    "",
-    `Cliente: ${dup?.cliente_oficial || "?"}`,
-    `Produto: ${dup?.produto_oficial || "?"}`,
-    `Quantidade: ${dup?.quantidade_gramas || "?"}g`,
-    `Data: ${dup?.data_venda || "?"}`,
-    "",
-    `Registro já existente: ${primeira ? JSON.stringify(primeira) : "não detalhado"}`,
-    "",
-    "Se quiser lançar mesmo assim, responda: confirmar duplicata"
-  ].join("\n");
+  if (quickCancelText(text)) {
+    return { intent: "cancel", confidence: 1 };
+  }
+
+  const prompt = `
+Interprete a intenção de controle do usuário em uma conversa de lançamentos de pedidos.
+
+Contexto:
+- existe lote pendente: ${hasPendingBatch ? "sim" : "nao"}
+- existe ação pendente: ${hasPendingAction ? "sim" : "nao"}
+
+Responda SOMENTE JSON válido neste formato:
+{
+  "intent": "confirm|cancel|none",
+  "confidence": number,
+  "motivo": "string"
+}
+
+Mensagem:
+${text}
+`.trim();
+
+  try {
+    const resp = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "Você responde apenas JSON válido." },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" }
+      },
+      {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+      }
+    );
+
+    return JSON.parse(String(resp.data?.choices?.[0]?.message?.content || "{}"));
+  } catch {
+    return { intent: "none", confidence: 0 };
+  }
+}
+
+function reactionLooksLikeConfirm(reactionUpdate) {
+  const reactions = Array.isArray(reactionUpdate?.new_reaction)
+    ? reactionUpdate.new_reaction
+    : [];
+
+  const emojis = reactions
+    .map((r) => r?.emoji || r?.type?.emoji || "")
+    .filter(Boolean);
+
+  return emojis.some((e) => ["👍", "✅", "👌", "💯", "🔥"].includes(e));
 }
 
 async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pending) {
-  if (!pending || isConfirmationText(incomingText) || isCancelText(incomingText)) {
+  if (!pending || quickConfirmationText(incomingText) || quickCancelText(incomingText)) {
     return false;
   }
 
@@ -1065,7 +1145,10 @@ async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pend
     duplicateAwaitingForce: false
   });
 
-  const novoResumo = summarizeOrders(applied.extraction);
+  const previewResp = await previewGoogleAppsScript({ pedidos: applied.extraction.pedidos });
+  const novoResumo = previewResp?.ok
+    ? formatOfficialPreviewMessage(previewResp)
+    : summarizeOrders(applied.extraction);
 
   await sendTelegramMessage(
     chatId,
@@ -1073,6 +1156,48 @@ async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pend
   );
 
   return true;
+}
+
+async function processBatchConfirmation(chatId, confirmationText = "") {
+  const pending = getPendingBatch(chatId);
+
+  if (!pending) {
+    await sendTelegramMessage(chatId, "Não encontrei nenhum lote pendente para confirmar.");
+    return;
+  }
+
+  const pedidos = Array.isArray(pending.extraction?.pedidos)
+    ? pending.extraction.pedidos
+    : [];
+
+  const forceDuplicateConfirmed =
+    normalizeText(confirmationText) === "confirmar duplicata" ||
+    pending?.meta?.duplicateAwaitingForce === true;
+
+  const gsResp = await callGoogleAppsScript({
+    action: "preencher_lote_v1",
+    pedidos,
+    meta: pending.meta || {},
+    force_duplicate_confirmed: forceDuplicateConfirmed
+  });
+
+  if (gsResp?.ok) {
+    clearPendingBatch(chatId);
+    await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
+  } else if (gsResp?.possible_duplicate) {
+    savePendingBatch(chatId, pending.extraction, {
+      ...(pending.meta || {}),
+      duplicateAwaitingForce: true
+    });
+
+    await sendTelegramMessage(chatId, formatDuplicateMessage(gsResp));
+  } else {
+    clearPendingBatch(chatId);
+    await sendTelegramMessage(
+      chatId,
+      `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
+    );
+  }
 }
 
 app.get("/", (req, res) => {
@@ -1095,6 +1220,29 @@ app.post("/telegram/webhook", async (req, res) => {
 
   try {
     const update = req.body || {};
+
+    if (update.message_reaction) {
+      const reactionUpdate = update.message_reaction;
+      const chatId = reactionUpdate?.chat?.id;
+
+      if (chatId && reactionLooksLikeConfirm(reactionUpdate)) {
+        const pendingAction = getPendingAction(chatId);
+        if (pendingAction?.type === "delete_fillings") {
+          clearPendingAction(chatId);
+          await executeDeleteAction(chatId, pendingAction.payload);
+          return;
+        }
+
+        const pendingBatch = getPendingBatch(chatId);
+        if (pendingBatch) {
+          await processBatchConfirmation(chatId, "👍");
+          return;
+        }
+      }
+
+      return;
+    }
+
     const msg = update.message || update.edited_message;
     if (!msg) return;
 
@@ -1102,65 +1250,78 @@ app.post("/telegram/webhook", async (req, res) => {
     if (!chatId) return;
 
     const text = (msg.text || msg.caption || "").trim();
+    const pendingAction = getPendingAction(chatId);
+    const pendingBatch = getPendingBatch(chatId);
 
-    if (text && isCancelText(text)) {
-      clearPendingBatch(chatId);
-      await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
-      return;
-    }
+    if (text) {
+      const control = await interpretUserControlIntent(
+        text,
+        !!pendingBatch,
+        !!pendingAction
+      );
 
-    if (text && isConfirmationText(text)) {
-      const pending = getPendingBatch(chatId);
+      if (pendingAction && control.intent === "confirm" && (control.confidence || 0) >= 0.7) {
+        if (pendingAction.type === "delete_fillings") {
+          clearPendingAction(chatId);
+          await executeDeleteAction(chatId, pendingAction.payload);
+          return;
+        }
+      }
 
-      if (!pending) {
-        await sendTelegramMessage(chatId, "Não encontrei nenhum lote pendente para confirmar.");
+      if (pendingAction && control.intent === "cancel" && (control.confidence || 0) >= 0.7) {
+        clearPendingAction(chatId);
+        await sendTelegramMessage(chatId, "Ação pendente cancelada.");
         return;
       }
 
-      const pedidos = Array.isArray(pending.extraction?.pedidos)
-        ? pending.extraction.pedidos
-        : [];
-
-      const forceDuplicateConfirmed =
-        normalizeText(text) === "confirmar duplicata" ||
-        pending?.meta?.duplicateAwaitingForce === true;
-
-      const gsResp = await callGoogleAppsScript({
-        action: "preencher_lote_v1",
-        pedidos,
-        meta: pending.meta || {},
-        force_duplicate_confirmed: forceDuplicateConfirmed
-      });
-
-      if (gsResp?.ok) {
-        clearPendingBatch(chatId);
-        await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
-      } else if (gsResp?.possible_duplicate) {
-        savePendingBatch(chatId, pending.extraction, {
-          ...(pending.meta || {}),
-          duplicateAwaitingForce: true
-        });
-
-        await sendTelegramMessage(chatId, formatDuplicateMessage(gsResp));
-      } else {
-        clearPendingBatch(chatId);
-        await sendTelegramMessage(
-          chatId,
-          `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
-        );
+      if (control.intent === "cancel" && (control.confidence || 0) >= 0.7 && !pendingAction) {
+        if (pendingBatch) {
+          clearPendingBatch(chatId);
+          await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
+          return;
+        }
       }
 
-      return;
+      if (control.intent === "confirm" && (control.confidence || 0) >= 0.7 && !pendingAction) {
+        if (pendingBatch) {
+          await processBatchConfirmation(chatId, text);
+          return;
+        }
+      }
     }
 
     if (text) {
-      const pending = getPendingBatch(chatId);
+      const deleteIntent = await interpretDeleteIntent(text);
 
-      const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
+      if (deleteIntent.is_delete) {
+        savePendingAction(chatId, {
+          type: "delete_fillings",
+          payload: deleteIntent
+        });
+
+        let resumo = "Entendi que você quer remover ";
+        if (deleteIntent.mode === "last") {
+          resumo += "o último preenchimento";
+        } else if (deleteIntent.mode === "all") {
+          resumo += "todos os preenchimentos atuais";
+        } else {
+          resumo += `os preenchimentos ${deleteIntent.indices.join(", ")}`;
+        }
+
+        await sendTelegramMessage(chatId, `${resumo}.\n\nPosso confirmar a remoção?`);
+        return;
+      }
+    }
+
+    if (text) {
+      const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pendingBatch);
       if (handledCorrection) return;
 
       const extraction = await extractOrdersFromText(text);
-      const resumo = summarizeOrders(extraction);
+      const previewResp = await previewGoogleAppsScript({ pedidos: extraction.pedidos });
+      const resumo = previewResp?.ok
+        ? formatOfficialPreviewMessage(previewResp)
+        : summarizeOrders(extraction);
 
       savePendingBatch(chatId, extraction, {
         source: "text",
@@ -1185,20 +1346,55 @@ app.post("/telegram/webhook", async (req, res) => {
         return;
       }
 
-      const pending = getPendingBatch(chatId);
+      const control = await interpretUserControlIntent(
+        transcription,
+        !!pendingBatch,
+        !!pendingAction
+      );
 
-      const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
+      if (pendingAction && control.intent === "confirm" && (control.confidence || 0) >= 0.7) {
+        if (pendingAction.type === "delete_fillings") {
+          clearPendingAction(chatId);
+          await executeDeleteAction(chatId, pendingAction.payload);
+          return;
+        }
+      }
+
+      if (pendingAction && control.intent === "cancel" && (control.confidence || 0) >= 0.7) {
+        clearPendingAction(chatId);
+        await sendTelegramMessage(chatId, "Ação pendente cancelada.");
+        return;
+      }
+
+      if (control.intent === "cancel" && (control.confidence || 0) >= 0.7 && !pendingAction) {
+        if (pendingBatch) {
+          clearPendingBatch(chatId);
+          await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
+          return;
+        }
+      }
+
+      if (control.intent === "confirm" && (control.confidence || 0) >= 0.7 && !pendingAction) {
+        if (pendingBatch) {
+          await processBatchConfirmation(chatId, transcription);
+          return;
+        }
+      }
+
+      const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pendingBatch);
       if (handledCorrection) return;
 
       const extraction = await extractOrdersFromText(transcription);
+      const previewResp = await previewGoogleAppsScript({ pedidos: extraction.pedidos });
+      const resumo = previewResp?.ok
+        ? formatOfficialPreviewMessage(previewResp)
+        : summarizeOrders(extraction);
 
       savePendingBatch(chatId, extraction, {
         source: "audio",
         transcription,
         duplicateAwaitingForce: false
       });
-
-      const resumo = summarizeOrders(extraction);
 
       await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"\n\n${resumo}`);
       return;
@@ -1213,7 +1409,8 @@ app.post("/telegram/webhook", async (req, res) => {
     try {
       const update = req.body || {};
       const msg = update.message || update.edited_message;
-      const chatId = msg?.chat?.id;
+      const reaction = update.message_reaction;
+      const chatId = msg?.chat?.id || reaction?.chat?.id;
 
       if (chatId) {
         await sendTelegramMessage(chatId, "Tive um erro ao processar sua mensagem.");
