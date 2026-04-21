@@ -234,6 +234,120 @@ function normalizeExtraction(extraction) {
   };
 }
 
+function parsePaymentText(rawText) {
+  const t = normalizeText(rawText);
+
+  if (t.includes("pix")) return "PIX";
+  if (t.includes("dinheiro")) return "Dinheiro à Vista";
+  if (t.includes("a vista") || t.includes("avista")) return "Dinheiro à Vista";
+
+  return null;
+}
+
+function inferGlobalContextFromText(text) {
+  const original = String(text || "").trim();
+  const normalized = normalizeText(original);
+
+  const context = {
+    cliente_falado: null,
+    data_falada: null,
+    vencimento_falado: null,
+    forma_pagamento_falada: null
+  };
+
+  const payment = parsePaymentText(original);
+  if (payment) {
+    context.forma_pagamento_falada = payment;
+  }
+
+  const explicitDates = [];
+
+  const reFull = /\b(\d{1,2}\/\d{1,2}\/\d{4})\b/g;
+  let m;
+  while ((m = reFull.exec(original)) !== null) {
+    explicitDates.push(normalizeDateValue(m[1]));
+  }
+
+  const reShort = /\b(\d{1,2}\/\d{1,2})\b/g;
+  while ((m = reShort.exec(original)) !== null) {
+    explicitDates.push(normalizeDateValue(m[1]));
+  }
+
+  if (normalized.includes("antes de ontem")) {
+    explicitDates.push(normalizeDateValue("antes de ontem"));
+  } else if (normalized.includes("ontem")) {
+    explicitDates.push(normalizeDateValue("ontem"));
+  } else if (normalized.includes("hoje")) {
+    explicitDates.push(normalizeDateValue("hoje"));
+  }
+
+  const uniqueDates = [...new Set(explicitDates.filter(Boolean))];
+  if (uniqueDates.length === 1) {
+    context.data_falada = uniqueDates[0];
+  }
+
+  const duePatterns = [
+    /\bvence(?:\s+no)?\s+dia\s+(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i,
+    /\bvencimento\s+(?:dia\s+)?(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i,
+    /\bvence\s+(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i
+  ];
+
+  for (const re of duePatterns) {
+    const match = original.match(re);
+    if (match) {
+      context.vencimento_falado = normalizeDateValue(match[1]);
+      break;
+    }
+  }
+
+  const clientePattern =
+    original.match(/^\s*([A-Za-zÀ-ÿ'’\-]+)\s+comprou\b/i);
+
+  if (clientePattern) {
+    context.cliente_falado = String(clientePattern[1] || "").trim() || null;
+  }
+
+  return context;
+}
+
+function applyBatchContextDefaults(extraction, rawText) {
+  const normalizedExtraction = normalizeExtraction(extraction);
+  const pedidos = Array.isArray(normalizedExtraction?.pedidos)
+    ? normalizedExtraction.pedidos
+    : [];
+
+  if (!pedidos.length) return normalizedExtraction;
+
+  const globalContext = inferGlobalContextFromText(rawText);
+
+  const filled = pedidos.map((pedido) => {
+    const out = { ...pedido };
+
+    if (!out.cliente_falado && globalContext.cliente_falado) {
+      out.cliente_falado = globalContext.cliente_falado;
+    }
+
+    if (!out.data_falada && globalContext.data_falada) {
+      out.data_falada = globalContext.data_falada;
+    }
+
+    if (!out.vencimento_falado && globalContext.vencimento_falado) {
+      out.vencimento_falado = globalContext.vencimento_falado;
+    }
+
+    if (!out.forma_pagamento_falada && globalContext.forma_pagamento_falada) {
+      out.forma_pagamento_falada = globalContext.forma_pagamento_falada;
+    }
+
+    return normalizeSinglePedido(out);
+  });
+
+  return {
+    ...normalizedExtraction,
+    pedidos: filled
+  };
+}
+
 async function extractOrdersFromText(text) {
   const prompt = `
 Você é um extrator de pedidos de vendas em português do Brasil.
@@ -250,9 +364,9 @@ Regras:
   Exemplo: "dois mil duzentos e cinquenta" => 2250
 - Se o usuário disser data da compra como "18/04", preserve "18/04".
 - Se o usuário disser "ontem", "antes de ontem" ou "hoje", preserve esse texto em data_falada.
-- Se o usuário disser vencimento por data, preserve em texto.
 - Se a forma de pagamento não for dita, retorne null.
 - Se o vencimento não for dito, retorne null.
+- Se um mesmo contexto geral de data, cliente, vencimento ou pagamento parecer valer para vários pedidos, ainda assim extraia pedido por pedido e preserve o máximo possível.
 - Retorne SOMENTE JSON válido.
 
 Formato exato:
@@ -307,7 +421,7 @@ ${text}
 
   try {
     const parsed = JSON.parse(content);
-    return normalizeExtraction(parsed);
+    return applyBatchContextDefaults(parsed, text);
   } catch (err) {
     return { pedidos: [], erro_parse: true, conteudo_bruto: content };
   }
@@ -334,16 +448,6 @@ function summarizeOrders(extraction) {
   });
 
   return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
-}
-
-function parsePaymentText(rawText) {
-  const t = normalizeText(rawText);
-
-  if (t.includes("pix")) return "PIX";
-  if (t.includes("dinheiro")) return "Dinheiro à Vista";
-  if (t.includes("a vista") || t.includes("avista")) return "Dinheiro à Vista";
-
-  return null;
 }
 
 function parseSimpleCorrection(text, pendingExtraction) {
@@ -879,12 +983,13 @@ function formatGoogleSuccessMessage(gsResp) {
     const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
     const valor = r.valor != null ? `R$ ${r.valor}` : "sem valor";
     const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
+    const linha = r.linha_item != null ? ` | linha ${r.linha_item}` : "";
     const forma = r.forma_pagamento || "PIX";
     const venc = r.vencimento || "?";
     const confianca =
       r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
 
-    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco} — ${forma} — venc. ${venc}${confianca}`;
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — R$ ${r.valor ?? "?"} — ${bloco}${linha} — ${forma} — venc. ${venc}${confianca}`;
   });
 
   return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
