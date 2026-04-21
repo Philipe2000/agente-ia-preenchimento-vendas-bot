@@ -212,6 +212,42 @@ function cloneExtraction(extraction) {
   return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
 }
 
+function parseBrazilianNumber(str) {
+  if (str == null) return null;
+  const cleaned = String(str).trim().replace(/\./g, "").replace(",", ".");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseDueDateText(rawText) {
+  const text = normalizeText(rawText);
+
+  let m = text.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yyyy = String(m[3]);
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  m = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (m) {
+    return `${m[1]}-${m[2]}-${m[3]}`;
+  }
+
+  return null;
+}
+
+function parsePaymentText(rawText) {
+  const t = normalizeText(rawText);
+
+  if (t.includes("pix")) return "PIX";
+  if (t.includes("dinheiro")) return "Dinheiro à Vista";
+  if (t.includes("a vista") || t.includes("avista")) return "Dinheiro à Vista";
+
+  return null;
+}
+
 function parseSimpleCorrection(text, pendingExtraction) {
   const pedidos = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos : [];
   if (!pedidos.length) return null;
@@ -220,18 +256,45 @@ function parseSimpleCorrection(text, pendingExtraction) {
   const itemIndexMatch = normalized.match(/\bitem\s+(\d+)\b/);
   const itemIndex = itemIndexMatch ? Number(itemIndexMatch[1]) : (pedidos.length === 1 ? 1 : null);
 
-  const qtyMatch = normalized.match(/\b(\d+(?:[.,]\d+)?)\s*(kg|g)\b/);
+  const qtyMatch =
+    normalized.match(/\b(\d+(?:[.,]\d+)?)\s*(kg|g)\b/) ||
+    normalized.match(/\bnao[, ]+e\s+(\d+(?:[.,]\d+)?)\s*(kg|g)\b/);
+
   if (qtyMatch && itemIndex) {
     return {
       is_correction: true,
       action: "update_quantity",
       item_index: itemIndex,
       fields: {
-        quantidade: Number(qtyMatch[1].replace(",", ".")),
+        quantidade: Number(String(qtyMatch[1]).replace(",", ".")),
         unidade: qtyMatch[2],
-        cliente_falado: null
+        cliente_falado: null,
+        valor_falado: null,
+        vencimento_falado: null,
+        forma_pagamento_falada: null,
+        produto_falado: null
       },
       motivo: "fallback regex quantidade"
+    };
+  }
+
+  const qtyOnlyMatch = normalized.match(/\bnao[, ]+e\s+(\d+(?:[.,]\d+)?)\b/);
+  if (qtyOnlyMatch && itemIndex) {
+    const currentUnit = pedidos[itemIndex - 1]?.unidade || "g";
+    return {
+      is_correction: true,
+      action: "update_quantity",
+      item_index: itemIndex,
+      fields: {
+        quantidade: Number(String(qtyOnlyMatch[1]).replace(",", ".")),
+        unidade: currentUnit,
+        cliente_falado: null,
+        valor_falado: null,
+        vencimento_falado: null,
+        forma_pagamento_falada: null,
+        produto_falado: null
+      },
+      motivo: "fallback regex quantidade sem unidade"
     };
   }
 
@@ -248,7 +311,11 @@ function parseSimpleCorrection(text, pendingExtraction) {
       fields: {
         quantidade: null,
         unidade: null,
-        cliente_falado: null
+        cliente_falado: null,
+        valor_falado: null,
+        vencimento_falado: null,
+        forma_pagamento_falada: null,
+        produto_falado: null
       },
       motivo: "fallback regex remove item"
     };
@@ -269,9 +336,104 @@ function parseSimpleCorrection(text, pendingExtraction) {
         fields: {
           quantidade: null,
           unidade: null,
-          cliente_falado: cliente
+          cliente_falado: cliente,
+          valor_falado: null,
+          vencimento_falado: null,
+          forma_pagamento_falada: null,
+          produto_falado: null
         },
         motivo: "fallback regex cliente"
+      };
+    }
+  }
+
+  const priceMatch =
+    normalized.match(/\bvalor\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
+    normalized.match(/\bpreco\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
+    normalized.match(/\bcusta\s+(\d+(?:[.,]\d+)?)\b/);
+
+  if (priceMatch && itemIndex) {
+    return {
+      is_correction: true,
+      action: "update_value",
+      item_index: itemIndex,
+      fields: {
+        quantidade: null,
+        unidade: null,
+        cliente_falado: null,
+        valor_falado: parseBrazilianNumber(priceMatch[1]),
+        vencimento_falado: null,
+        forma_pagamento_falada: null,
+        produto_falado: null
+      },
+      motivo: "fallback regex valor"
+    };
+  }
+
+  const dueDate = parseDueDateText(text);
+  if (
+    itemIndex &&
+    dueDate &&
+    (normalized.includes("vence") || normalized.includes("vencimento") || normalized.includes("dia"))
+  ) {
+    return {
+      is_correction: true,
+      action: "update_due_date",
+      item_index: itemIndex,
+      fields: {
+        quantidade: null,
+        unidade: null,
+        cliente_falado: null,
+        valor_falado: null,
+        vencimento_falado: dueDate,
+        forma_pagamento_falada: null,
+        produto_falado: null
+      },
+      motivo: "fallback regex vencimento"
+    };
+  }
+
+  const payment = parsePaymentText(text);
+  if (payment && itemIndex) {
+    return {
+      is_correction: true,
+      action: "update_payment",
+      item_index: itemIndex,
+      fields: {
+        quantidade: null,
+        unidade: null,
+        cliente_falado: null,
+        valor_falado: null,
+        vencimento_falado: null,
+        forma_pagamento_falada: payment,
+        produto_falado: null
+      },
+      motivo: "fallback regex pagamento"
+    };
+  }
+
+  const productMatch =
+    normalized.match(/\btroca\s+o\s+produto\s+para\s+(.+)$/) ||
+    normalized.match(/\bo\s+produto\s+e\s+(.+)$/) ||
+    normalized.match(/\bproduto\s+(.+)$/);
+
+  if (productMatch && itemIndex) {
+    const produto = String(productMatch[1] || "").trim();
+    if (produto) {
+      return {
+        is_correction: true,
+        action: "update_product",
+        item_index: itemIndex,
+        fields: {
+          quantidade: null,
+          unidade: null,
+          cliente_falado: null,
+          valor_falado: null,
+          vencimento_falado: null,
+          forma_pagamento_falada: null,
+          produto_falado: produto
+        },
+        motivo: "fallback regex produto"
       };
     }
   }
@@ -297,21 +459,29 @@ Sua tarefa:
 - se for, retornar a ação estruturada
 - se não for, retornar "is_correction": false
 
-Ações permitidas nesta V1.1:
+Ações permitidas nesta V1.1 parte 2:
 - alterar quantidade de um item
 - alterar cliente de um item
 - remover um item
+- alterar valor de um item
+- alterar vencimento de um item
+- alterar forma de pagamento de um item
+- alterar produto de um item
 
 Retorne SOMENTE JSON válido neste formato:
 
 {
   "is_correction": true ou false,
-  "action": "update_quantity|update_client|remove_item|null",
+  "action": "update_quantity|update_client|remove_item|update_value|update_due_date|update_payment|update_product|null",
   "item_index": number ou null,
   "fields": {
     "quantidade": number ou null,
     "unidade": "g|kg|un|null",
-    "cliente_falado": "string ou null"
+    "cliente_falado": "string ou null",
+    "valor_falado": number ou null,
+    "vencimento_falado": "string ou null",
+    "forma_pagamento_falada": "PIX|Dinheiro à Vista|string|null",
+    "produto_falado": "string ou null"
   },
   "motivo": "string"
 }
@@ -319,10 +489,10 @@ Retorne SOMENTE JSON válido neste formato:
 Regras:
 - item_index é baseado em 1
 - se o usuário não disser item, e houver só 1 pedido, use item_index = 1
-- para "não, é 300g", tente entender como correção de quantidade
-- para "troca o cliente para Flávio", tente entender como correção de cliente
-- para "remove o item 2", use remove_item
 - se a mensagem parecer um pedido novo e não correção, retorne is_correction false
+- para vencimento, prefira formato YYYY-MM-DD quando conseguir
+- para valor, retorne número
+- para forma de pagamento, prefira PIX ou Dinheiro à Vista
 
 Mensagem do usuário:
 ${text}
@@ -423,6 +593,66 @@ function applyCorrectionToExtraction(extraction, correction) {
       ok: true,
       extraction: novo,
       message: `Removi o item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_value") {
+    const valor = correction?.fields?.valor_falado;
+    if (valor == null || !Number.isFinite(Number(valor))) {
+      return { ok: false, message: "Não consegui entender o novo valor." };
+    }
+
+    item.valor_falado = Number(valor);
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o valor do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_due_date") {
+    const vencimento = String(correction?.fields?.vencimento_falado || "").trim();
+    if (!vencimento) {
+      return { ok: false, message: "Não consegui entender o novo vencimento." };
+    }
+
+    item.vencimento_falado = vencimento;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o vencimento do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_payment") {
+    const forma = String(correction?.fields?.forma_pagamento_falada || "").trim();
+    if (!forma) {
+      return { ok: false, message: "Não consegui entender a nova forma de pagamento." };
+    }
+
+    item.forma_pagamento_falada = forma;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi a forma de pagamento do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_product") {
+    const produto = String(correction?.fields?.produto_falado || "").trim();
+    if (!produto) {
+      return { ok: false, message: "Não consegui entender o novo produto." };
+    }
+
+    item.produto_falado = produto;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o produto do item ${idx + 1}.`
     };
   }
 
