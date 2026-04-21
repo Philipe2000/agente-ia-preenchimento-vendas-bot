@@ -94,6 +94,35 @@ function isConfirmationText(text) {
   );
 }
 
+function isCancelText(text) {
+  const t = normalizeText(text);
+
+  return (
+    t === "cancelar" ||
+    t === "cancelar lote" ||
+    t === "limpar" ||
+    t === "limpar lote" ||
+    t === "comecar de novo" ||
+    t === "recomecar" ||
+    t === "apagar lote"
+  );
+}
+
+function looksLikeFreshOrderMessage(text) {
+  const t = normalizeText(text);
+
+  return (
+    t.includes("comprou") ||
+    t.includes("pedido") ||
+    /\b\d+(?:[.,]\d+)?\s*(g|kg)\b/.test(t) ||
+    /\br\$\s*\d+/.test(t) ||
+    t.includes("valor") ||
+    t.includes("vence") ||
+    t.includes("vencimento") ||
+    t.includes("no dia")
+  );
+}
+
 function cloneExtraction(extraction) {
   return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
 }
@@ -466,11 +495,7 @@ function parseSimpleCorrection(text, pendingExtraction) {
 
 function detectBatchRewriteIntent(text) {
   const t = normalizeText(text);
-  return (
-    t.includes("comprou") ||
-    t.includes("pedido") ||
-    t.includes("pedidos")
-  );
+  return t.includes("comprou") || t.includes("pedido") || t.includes("pedidos");
 }
 
 async function tryBuildBatchRewriteCorrection(text, pendingExtraction) {
@@ -887,7 +912,7 @@ function formatDuplicateMessage(gsResp) {
 }
 
 async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pending) {
-  if (!pending || isConfirmationText(incomingText)) {
+  if (!pending || isConfirmationText(incomingText) || isCancelText(incomingText)) {
     return false;
   }
 
@@ -900,6 +925,10 @@ async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pend
   const applied = await applyCorrectionToExtraction(pending.extraction, correction);
 
   if (!applied.ok) {
+    if (looksLikeFreshOrderMessage(incomingText)) {
+      return false;
+    }
+
     await sendTelegramMessage(chatId, applied.message);
     return true;
   }
@@ -948,6 +977,12 @@ app.post("/telegram/webhook", async (req, res) => {
     if (!chatId) return;
 
     const text = (msg.text || msg.caption || "").trim();
+
+    if (text && isCancelText(text)) {
+      clearPendingBatch(chatId);
+      await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
+      return;
+    }
 
     if (text && isConfirmationText(text)) {
       const pending = getPendingBatch(chatId);
@@ -1020,8 +1055,8 @@ app.post("/telegram/webhook", async (req, res) => {
       const audioBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
       const transcription = await transcribeAudioWithOpenAI(audioBuffer, "audio.ogg");
 
-      if (!transcription) {
-        await sendTelegramMessage(chatId, "Não consegui transcrever esse áudio.");
+      if (!transcription || !String(transcription).trim()) {
+        await sendTelegramMessage(chatId, "Não consegui transcrever esse áudio. Se quiser, mande de novo ou envie texto.");
         return;
       }
 
