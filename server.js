@@ -68,12 +68,150 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   return resp.data?.text || "";
 }
 
+function normalizeText(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isConfirmationText(text) {
+  const t = normalizeText(text);
+
+  return (
+    t === "sim" ||
+    t === "ok" ||
+    t === "certo" ||
+    t === "isso" ||
+    t === "confirmar" ||
+    t === "pode confirmar" ||
+    t === "confirme" ||
+    t === "confirmar sim" ||
+    t === "confirme tudo" ||
+    t === "confirmar duplicata"
+  );
+}
+
+function cloneExtraction(extraction) {
+  return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
+}
+
+function savePendingBatch(chatId, extraction, meta = {}) {
+  pendingBatches.set(String(chatId), {
+    extraction,
+    meta,
+    createdAt: new Date().toISOString()
+  });
+}
+
+function getPendingBatch(chatId) {
+  return pendingBatches.get(String(chatId)) || null;
+}
+
+function clearPendingBatch(chatId) {
+  pendingBatches.delete(String(chatId));
+}
+
+function parseBrazilianNumber(str) {
+  if (str == null) return null;
+  const cleaned = String(str).trim().replace(/\./g, "").replace(",", ".");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatDateToIso(date) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function normalizeDateValue(rawText) {
+  const original = String(rawText || "").trim();
+  if (!original) return null;
+
+  const t = normalizeText(original);
+  const now = new Date();
+
+  if (t === "hoje") {
+    return formatDateToIso(now);
+  }
+
+  if (t === "ontem") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    return formatDateToIso(d);
+  }
+
+  if (t === "antes de ontem") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 2);
+    return formatDateToIso(d);
+  }
+
+  let m = original.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    return `${m[1]}-${m[2]}-${m[3]}`;
+  }
+
+  m = original.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yyyy = String(m[3]);
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  m = original.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yyyy = String(now.getFullYear());
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  return original;
+}
+
+function normalizeSinglePedido(pedido) {
+  const out = { ...(pedido || {}) };
+
+  if (out.quantidade != null && Number.isFinite(Number(out.quantidade))) {
+    out.quantidade = Number(out.quantidade);
+  }
+
+  if (out.valor_falado != null && Number.isFinite(Number(out.valor_falado))) {
+    out.valor_falado = Number(out.valor_falado);
+  }
+
+  if (out.data_falada) {
+    out.data_falada = normalizeDateValue(out.data_falada);
+  }
+
+  if (out.vencimento_falado) {
+    out.vencimento_falado = normalizeDateValue(out.vencimento_falado);
+  }
+
+  return out;
+}
+
+function normalizeExtraction(extraction) {
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
+  return {
+    ...extraction,
+    pedidos: pedidos.map(normalizeSinglePedido)
+  };
+}
+
 async function extractOrdersFromText(text) {
   const prompt = `
 Você é um extrator de pedidos de vendas em português do Brasil.
 
 Converta a mensagem do usuário em JSON.
 A mensagem pode conter de 1 a 10 pedidos.
+Pode haver pedidos do mesmo cliente ou de clientes diferentes na mesma mensagem.
 Se não houver clareza suficiente, ainda tente extrair o máximo com cautela.
 
 Regras:
@@ -81,6 +219,8 @@ Regras:
 - Se a quantidade vier em g/gramas, preserve unidade = "g".
 - Se o usuário disser um valor por extenso, converta para número.
   Exemplo: "dois mil duzentos e cinquenta" => 2250
+- Se o usuário disser data da compra como "18/04", preserve "18/04".
+- Se o usuário disser "ontem", "antes de ontem" ou "hoje", preserve esse texto em data_falada.
 - Se o usuário disser vencimento por data, preserve em texto.
 - Se a forma de pagamento não for dita, retorne null.
 - Se o vencimento não for dito, retorne null.
@@ -137,7 +277,8 @@ ${text}
   console.log("Resposta bruta da OpenAI extractOrdersFromText:", content);
 
   try {
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+    return normalizeExtraction(parsed);
   } catch (err) {
     return { pedidos: [], erro_parse: true, conteudo_bruto: content };
   }
@@ -166,78 +307,6 @@ function summarizeOrders(extraction) {
   return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
 }
 
-function normalizeText(text) {
-  return String(text || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isConfirmationText(text) {
-  const t = normalizeText(text);
-
-  return (
-    t === "sim" ||
-    t === "ok" ||
-    t === "certo" ||
-    t === "isso" ||
-    t === "confirmar" ||
-    t === "pode confirmar" ||
-    t === "confirme" ||
-    t === "confirmar sim" ||
-    t === "confirme tudo" ||
-    t === "confirmar duplicata"
-  );
-}
-
-function savePendingBatch(chatId, extraction, meta = {}) {
-  pendingBatches.set(String(chatId), {
-    extraction,
-    meta,
-    createdAt: new Date().toISOString()
-  });
-}
-
-function getPendingBatch(chatId) {
-  return pendingBatches.get(String(chatId)) || null;
-}
-
-function clearPendingBatch(chatId) {
-  pendingBatches.delete(String(chatId));
-}
-
-function cloneExtraction(extraction) {
-  return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
-}
-
-function parseBrazilianNumber(str) {
-  if (str == null) return null;
-  const cleaned = String(str).trim().replace(/\./g, "").replace(",", ".");
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : null;
-}
-
-function parseDueDateText(rawText) {
-  const text = normalizeText(rawText);
-
-  let m = text.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
-  if (m) {
-    const dd = String(m[1]).padStart(2, "0");
-    const mm = String(m[2]).padStart(2, "0");
-    const yyyy = String(m[3]);
-    return `${yyyy}-${mm}-${dd}`;
-  }
-
-  m = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  if (m) {
-    return `${m[1]}-${m[2]}-${m[3]}`;
-  }
-
-  return null;
-}
-
 function parsePaymentText(rawText) {
   const t = normalizeText(rawText);
 
@@ -256,28 +325,22 @@ function parseSimpleCorrection(text, pendingExtraction) {
   const itemIndexMatch = normalized.match(/\bitem\s+(\d+)\b/);
   const itemIndex = itemIndexMatch ? Number(itemIndexMatch[1]) : (pedidos.length === 1 ? 1 : null);
 
-  if (!itemIndex) return null;
+  const removeMatch =
+    normalized.match(/\bremove(?:r)?\s+o\s+item\s+(\d+)\b/) ||
+    normalized.match(/\bapaga(?:r)?\s+o\s+item\s+(\d+)\b/) ||
+    normalized.match(/\bexclui(?:r)?\s+o\s+item\s+(\d+)\b/);
 
-  const looksLikeFullRewrite =
-    normalized.includes("comprou") ||
-    normalized.includes("valor") ||
-    normalized.includes("preco") ||
-    normalized.includes("vence") ||
-    normalized.includes("vencimento") ||
-    normalized.includes("pix") ||
-    normalized.includes("dinheiro") ||
-    normalized.includes("a vista");
-
-  if (looksLikeFullRewrite) {
+  if (removeMatch) {
     return {
       is_correction: true,
-      action: "replace_item_fields",
-      item_index: itemIndex,
+      action: "remove_item",
+      item_index: Number(removeMatch[1]),
       fields: {},
-      raw_text: text,
-      motivo: "fallback frase completa"
+      motivo: "fallback regex remove item"
     };
   }
+
+  if (!itemIndex) return null;
 
   const qtyMatch =
     normalized.match(/\b(\d+(?:[.,]\d+)?)\s*(kg|g)\b/) ||
@@ -311,21 +374,6 @@ function parseSimpleCorrection(text, pendingExtraction) {
     };
   }
 
-  const removeMatch =
-    normalized.match(/\bremove(?:r)?\s+o\s+item\s+(\d+)\b/) ||
-    normalized.match(/\bapaga(?:r)?\s+o\s+item\s+(\d+)\b/) ||
-    normalized.match(/\bexclui(?:r)?\s+o\s+item\s+(\d+)\b/);
-
-  if (removeMatch) {
-    return {
-      is_correction: true,
-      action: "remove_item",
-      item_index: Number(removeMatch[1]),
-      fields: {},
-      motivo: "fallback regex remove item"
-    };
-  }
-
   const clientMatch =
     normalized.match(/\btroca\s+o\s+cliente\s+para\s+(.+)$/) ||
     normalized.match(/\bo\s+cliente\s+e\s+(.+)$/) ||
@@ -346,10 +394,137 @@ function parseSimpleCorrection(text, pendingExtraction) {
     }
   }
 
+  const valueMatch =
+    normalized.match(/\bvalor\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
+    normalized.match(/\bpreco\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
+    normalized.match(/\bcusta\s+(\d+(?:[.,]\d+)?)\b/);
+
+  if (valueMatch) {
+    return {
+      is_correction: true,
+      action: "update_value",
+      item_index: itemIndex,
+      fields: {
+        valor_falado: parseBrazilianNumber(valueMatch[1])
+      },
+      motivo: "fallback regex valor"
+    };
+  }
+
+  const payment = parsePaymentText(text);
+  if (payment) {
+    return {
+      is_correction: true,
+      action: "update_payment",
+      item_index: itemIndex,
+      fields: {
+        forma_pagamento_falada: payment
+      },
+      motivo: "fallback regex pagamento"
+    };
+  }
+
+  const dueDate = normalizeDateValue(text);
+  if (
+    dueDate &&
+    dueDate !== String(text).trim() &&
+    (normalized.includes("vence") || normalized.includes("vencimento") || normalized.includes("dia"))
+  ) {
+    return {
+      is_correction: true,
+      action: "update_due_date",
+      item_index: itemIndex,
+      fields: {
+        vencimento_falado: dueDate
+      },
+      motivo: "fallback regex vencimento"
+    };
+  }
+
+  const productMatch =
+    normalized.match(/\btroca\s+o\s+produto\s+para\s+(.+)$/) ||
+    normalized.match(/\bo\s+produto\s+e\s+(.+)$/) ||
+    normalized.match(/\bproduto\s+(.+)$/);
+
+  if (productMatch) {
+    const produto = String(productMatch[1] || "").trim();
+    if (produto) {
+      return {
+        is_correction: true,
+        action: "update_product",
+        item_index: itemIndex,
+        fields: {
+          produto_falado: produto
+        },
+        motivo: "fallback regex produto"
+      };
+    }
+  }
+
+  return null;
+}
+
+function detectBatchRewriteIntent(text) {
+  const t = normalizeText(text);
+  return (
+    t.includes("comprou") ||
+    t.includes("pedido") ||
+    t.includes("pedidos")
+  );
+}
+
+async function tryBuildBatchRewriteCorrection(text, pendingExtraction) {
+  if (!detectBatchRewriteIntent(text)) return null;
+
+  const extracted = await extractOrdersFromText(text);
+  const pedidos = Array.isArray(extracted?.pedidos) ? extracted.pedidos : [];
+  if (!pedidos.length) return null;
+
+  const normalized = normalizeText(text);
+  const itemIndexMatch = normalized.match(/\bitem\s+(\d+)\b/);
+  const itemIndex = itemIndexMatch ? Number(itemIndexMatch[1]) : null;
+  const currentCount = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos.length : 0;
+
+  if (pedidos.length > 1) {
+    return {
+      is_correction: true,
+      action: "replace_batch",
+      item_index: null,
+      fields: {},
+      replacement_extraction: extracted,
+      motivo: "reescrita completa do lote"
+    };
+  }
+
+  if (pedidos.length === 1 && itemIndex) {
+    return {
+      is_correction: true,
+      action: "replace_item_fields",
+      item_index: itemIndex,
+      fields: {},
+      replacement_pedido: pedidos[0],
+      motivo: "reescrita completa do item"
+    };
+  }
+
+  if (pedidos.length === 1 && currentCount === 1) {
+    return {
+      is_correction: true,
+      action: "replace_batch",
+      item_index: null,
+      fields: {},
+      replacement_extraction: extracted,
+      motivo: "substituicao total de lote com um item"
+    };
+  }
+
   return null;
 }
 
 async function interpretCorrectionFromText(text, pendingExtraction) {
+  const batchRewrite = await tryBuildBatchRewriteCorrection(text, pendingExtraction);
+  if (batchRewrite) return batchRewrite;
+
   const fallback = parseSimpleCorrection(text, pendingExtraction);
   if (fallback) return fallback;
 
@@ -371,13 +546,18 @@ Ações permitidas:
 - alterar quantidade de um item
 - alterar cliente de um item
 - remover um item
-- substituir vários campos do item ao mesmo tempo
+- alterar produto de um item
+- alterar valor de um item
+- alterar vencimento de um item
+- alterar forma de pagamento de um item
+- substituir vários campos de um item
+- substituir o lote inteiro
 
 Retorne SOMENTE JSON válido neste formato:
 
 {
   "is_correction": true ou false,
-  "action": "update_quantity|update_client|remove_item|replace_item_fields|null",
+  "action": "update_quantity|update_client|remove_item|update_product|update_value|update_due_date|update_payment|replace_item_fields|replace_batch|null",
   "item_index": number ou null,
   "fields": {
     "cliente_falado": "string ou null",
@@ -386,18 +566,19 @@ Retorne SOMENTE JSON válido neste formato:
     "unidade": "g|kg|un|null",
     "valor_falado": number ou null,
     "forma_pagamento_falada": "PIX|Dinheiro à Vista|string|null",
-    "vencimento_falado": "string ou null"
+    "vencimento_falado": "string ou null",
+    "data_falada": "string ou null"
   },
-  "raw_text": "string ou null",
   "motivo": "string"
 }
 
 Regras:
 - item_index é baseado em 1
 - se o usuário não disser item, e houver só 1 pedido, use item_index = 1
-- se a mensagem parecer uma nova frase completa reescrevendo o item, use action = "replace_item_fields"
-- em replace_item_fields, preencha todos os campos que conseguir
+- se a mensagem reescrever o lote inteiro, use replace_batch
+- se a mensagem reescrever só um item, use replace_item_fields
 - se a mensagem parecer um pedido novo e não correção, retorne is_correction false
+- para data_falada e vencimento_falado, preserve o texto que conseguir
 
 Mensagem do usuário:
 ${text}
@@ -434,29 +615,55 @@ ${JSON.stringify({ pedidos }, null, 2)}
   const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
 
   try {
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+
+    if (parsed?.fields?.data_falada) {
+      parsed.fields.data_falada = normalizeDateValue(parsed.fields.data_falada);
+    }
+
+    if (parsed?.fields?.vencimento_falado) {
+      parsed.fields.vencimento_falado = normalizeDateValue(parsed.fields.vencimento_falado);
+    }
+
+    return parsed;
   } catch (err) {
     return {
       is_correction: false,
       action: null,
       item_index: null,
       fields: {},
-      raw_text: null,
       motivo: "Falha ao interpretar correção"
     };
   }
 }
 
-async function extractSingleOrderForReplacement(text) {
-  const extraction = await extractOrdersFromText(text);
-  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
-  if (!pedidos.length) return null;
-  return pedidos[0];
-}
-
 async function applyCorrectionToExtraction(extraction, correction) {
   const novo = cloneExtraction(extraction);
   const pedidos = Array.isArray(novo.pedidos) ? novo.pedidos : [];
+
+  if (correction?.action === "replace_batch") {
+    const replacement = normalizeExtraction(
+      correction?.replacement_extraction || { pedidos: [] }
+    );
+    const novosPedidos = Array.isArray(replacement?.pedidos) ? replacement.pedidos : [];
+
+    if (!novosPedidos.length) {
+      return {
+        ok: false,
+        message: "Não consegui entender o novo lote completo."
+      };
+    }
+
+    return {
+      ok: true,
+      extraction: {
+        ...novo,
+        pedidos: novosPedidos
+      },
+      message: `Substituí o lote inteiro por ${novosPedidos.length} pedido(s).`
+    };
+  }
+
   const idx = Number(correction?.item_index || 0) - 1;
 
   if (idx < 0 || idx >= pedidos.length) {
@@ -499,6 +706,66 @@ async function applyCorrectionToExtraction(extraction, correction) {
     };
   }
 
+  if (action === "update_product") {
+    const produto = String(correction?.fields?.produto_falado || "").trim();
+    if (!produto) {
+      return { ok: false, message: "Não consegui entender o novo produto." };
+    }
+
+    item.produto_falado = produto;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o produto do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_value") {
+    const valor = correction?.fields?.valor_falado;
+    if (valor == null || !Number.isFinite(Number(valor))) {
+      return { ok: false, message: "Não consegui entender o novo valor." };
+    }
+
+    item.valor_falado = Number(valor);
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o valor do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_due_date") {
+    const vencimento = String(correction?.fields?.vencimento_falado || "").trim();
+    if (!vencimento) {
+      return { ok: false, message: "Não consegui entender o novo vencimento." };
+    }
+
+    item.vencimento_falado = vencimento;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o vencimento do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_payment") {
+    const forma = String(correction?.fields?.forma_pagamento_falada || "").trim();
+    if (!forma) {
+      return { ok: false, message: "Não consegui entender a nova forma de pagamento." };
+    }
+
+    item.forma_pagamento_falada = forma;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi a forma de pagamento do item ${idx + 1}.`
+    };
+  }
+
   if (action === "remove_item") {
     pedidos.splice(idx, 1);
 
@@ -510,8 +777,11 @@ async function applyCorrectionToExtraction(extraction, correction) {
   }
 
   if (action === "replace_item_fields") {
-    const replaced = await extractSingleOrderForReplacement(correction?.raw_text || "");
-    if (!replaced) {
+    const replacementPedido = correction?.replacement_pedido
+      ? normalizeSinglePedido(correction.replacement_pedido)
+      : null;
+
+    if (!replacementPedido) {
       return {
         ok: false,
         message: "Não consegui entender a correção completa desse item."
@@ -520,14 +790,15 @@ async function applyCorrectionToExtraction(extraction, correction) {
 
     pedidos[idx] = {
       ...item,
-      ...replaced,
-      cliente_falado: replaced.cliente_falado || item.cliente_falado,
-      produto_falado: replaced.produto_falado || item.produto_falado,
-      quantidade: replaced.quantidade != null ? replaced.quantidade : item.quantidade,
-      unidade: replaced.unidade || item.unidade,
-      valor_falado: replaced.valor_falado != null ? replaced.valor_falado : item.valor_falado,
-      forma_pagamento_falada: replaced.forma_pagamento_falada || item.forma_pagamento_falada,
-      vencimento_falado: replaced.vencimento_falado || item.vencimento_falado
+      ...replacementPedido,
+      cliente_falado: replacementPedido.cliente_falado || item.cliente_falado,
+      produto_falado: replacementPedido.produto_falado || item.produto_falado,
+      quantidade: replacementPedido.quantidade != null ? replacementPedido.quantidade : item.quantidade,
+      unidade: replacementPedido.unidade || item.unidade,
+      valor_falado: replacementPedido.valor_falado != null ? replacementPedido.valor_falado : item.valor_falado,
+      forma_pagamento_falada: replacementPedido.forma_pagamento_falada || item.forma_pagamento_falada,
+      vencimento_falado: replacementPedido.vencimento_falado || item.vencimento_falado,
+      data_falada: replacementPedido.data_falada || item.data_falada
     };
 
     return {
