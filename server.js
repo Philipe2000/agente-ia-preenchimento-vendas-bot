@@ -50,7 +50,27 @@ async function downloadTelegramFileBuffer(filePath) {
 async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   const form = new FormData();
   form.append("file", buffer, filename);
-  form.append("model", "gpt-4o-mini-transcribe");
+
+  // Modelo mais forte de transcrição
+  form.append("model", "gpt-4o-transcribe");
+
+  // Idioma esperado
+  form.append("language", "pt");
+
+  // Vocabulário útil do seu negócio
+  form.append(
+    "prompt",
+    [
+      "Transcrição em português do Brasil.",
+      "Nomes frequentes de clientes:",
+      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia.",
+      "Produtos frequentes:",
+      "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
+      "Medidas frequentes:",
+      "55cm, 60/65cm, 65/70cm, 70/75cm.",
+      "Se houver nomes próprios raros, tente preservar a forma fonética mais próxima possível."
+    ].join(" ")
+  );
 
   const resp = await axios.post(
     "https://api.openai.com/v1/audio/transcriptions",
@@ -989,7 +1009,7 @@ function formatGoogleSuccessMessage(gsResp) {
     const confianca =
       r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
 
-    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — R$ ${r.valor ?? "?"} — ${bloco}${linha} — ${forma} — venc. ${venc}${confianca}`;
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco}${linha} — ${forma} — venc. ${venc}${confianca}`;
   });
 
   return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
