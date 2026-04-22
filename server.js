@@ -11,6 +11,7 @@ app.use(express.json({ limit: "20mb" }));
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
 const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
 /**
@@ -81,20 +82,31 @@ async function downloadTelegramFileBuffer(filePath) {
 async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   const form = new FormData();
   form.append("file", buffer, filename);
-  form.append("model", "gpt-4o-transcribe");
+  form.append("model", OPENAI_TRANSCRIBE_MODEL);
   form.append("language", "pt");
 
   form.append(
     "prompt",
     [
       "Transcrição em português do Brasil.",
-      "Nomes frequentes de clientes:",
-      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia.",
+      "Contexto: assistente operacional de recebimentos e vendas via Telegram.",
+      "Preserve com máxima fidelidade nomes próprios, datas, valores, códigos curtos e comandos.",
+      "Comandos frequentes de recebimentos:",
+      "preencha recebimentos de hoje",
+      "preencha recebimentos dos ultimos 7 dias",
+      "associar P1 Diergia",
+      "confirmar lote",
+      "cancelar lote",
+      "remover 5",
+      "Datas podem aparecer como 18/04, 18-04, 19/04, 20/04.",
+      "Se houver código como P1, P2, I1, I2, preserve exatamente.",
+      "Se houver valor monetário, preserve os números com máxima fidelidade.",
+      "Nomes frequentes de clientes e pessoas:",
+      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu, Edilene, Eliete, Izabel.",
       "Produtos frequentes:",
       "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
       "Medidas frequentes:",
-      "55cm, 60/65cm, 65/70cm, 70/75cm.",
-      "Se houver nomes próprios raros, tente preservar a forma fonética mais próxima possível."
+      "55cm, 60/65cm, 65/70cm, 70/75cm."
     ].join(" ")
   );
 
@@ -233,10 +245,15 @@ function summarizePendingRecebimentos(lote) {
   }
 
   linhas.push("", "Comandos:");
-  linhas.push("- associar P1 a CLIENTE_OFICIAL");
+  linhas.push("- associar P1 NOME_DO_CLIENTE_OFICIAL");
   linhas.push("- remover 5");
   linhas.push("- confirmar lote");
   linhas.push("- cancelar lote");
+  linhas.push("");
+  linhas.push("Exemplo:");
+  linhas.push("- associar P1 Diergia");
+  linhas.push("");
+  linhas.push("Você pode usar qualquer cliente oficial do MAPA_CLIENTES.");
 
   return linhas.join("\n");
 }
@@ -308,7 +325,7 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
     await sendTelegramMessage(
       chatId,
       [
-        `Associação salva:`,
+        "Associação salva:",
         `${pendencia.nome_extraido} -> ${associar.clienteOficial}`,
         "",
         summarizePendingRecebimentos(lote)
@@ -341,7 +358,7 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
     await sendTelegramMessage(
       chatId,
       [
-        `Item removido do lote:`,
+        "Item removido do lote:",
         `${remover.itemNumero}. ${removido.cliente_oficial} | ${removido.data_pagamento} | ${formatMoneyBRL(removido.valor)}`,
         "",
         summarizePendingRecebimentos(lote)
@@ -1157,6 +1174,8 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(transcription, msg)) {
+        await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
+
         await handleRecebimentosMessage({
           message: msg,
           text: transcription,
