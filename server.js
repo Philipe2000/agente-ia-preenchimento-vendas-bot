@@ -248,7 +248,9 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
   const associar = parseAssociarPendenciaCommand(text);
   if (associar) {
     const pendencias = Array.isArray(lote.pendencias_associacao) ? lote.pendencias_associacao : [];
-    const idx = pendencias.findIndex(p => String(p.id_local).toUpperCase() === associar.pendenciaId);
+    const idx = pendencias.findIndex(
+      p => String(p.id_local || "").toUpperCase() === associar.pendenciaId
+    );
 
     if (idx < 0) {
       await sendTelegramMessage(chatId, `Não encontrei a pendência ${associar.pendenciaId}.`);
@@ -288,6 +290,7 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
       id_transacao: pendencia.id_transacao || null,
       assunto_email: pendencia.assunto_email || "",
       remetente: pendencia.remetente || "",
+      message_id: pendencia.message_id || "",
       status: "pronto"
     };
 
