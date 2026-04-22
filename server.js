@@ -1,997 +1,427 @@
-const PV1_SPREADSHEET_ID = "11IMG566GZByCTvuKQ4LM32QTY16ZhFJMXBY4hDiLir4";
-const PV1_DRIVE_REGISTRO_VENDAS_FOLDER_ID = "1he9x9YMog0MZtImMKZUVtEU0ErOz68SY";
+const express = require("express");
+const axios = require("axios");
+const FormData = require("form-data");
+const { isRecebimentosIntent } = require("./intents_recebimentos");
+const { handleRecebimentosMessage } = require("./recebimentos");
 
-function doGet(e) {
-  return ContentService
-    .createTextOutput(JSON.stringify({
-      ok: true,
-      service: "AgenteIAPreenchimentovendasaudiotexto",
-      status: "online"
-    }))
-    .setMimeType(ContentService.MimeType.JSON);
+const app = express();
+app.use(express.json({ limit: "20mb" }));
+
+const PORT = process.env.PORT || 3000;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
+
+const pendingBatches = new Map();
+
+function telegramApiUrl(method) {
+  return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 }
 
-function doPost(e) {
-  try {
-    const body = e && e.postData && e.postData.contents
-      ? JSON.parse(e.postData.contents)
-      : {};
-
-    const action = String(body.action || "").trim();
-
-    if (action === "preencher_lote_v1") {
-      return pv1JsonOutput_(pv1PreencherLoteV1_(body));
-    }
-
-    if (action === "preview_lote_v1") {
-      return pv1JsonOutput_(pv1PreviewLoteV1_(body));
-    }
-
-    if (action === "delete_preenchimentos_v1") {
-      return pv1JsonOutput_(pv1DeletePreenchimentosV1_(body));
-    }
-
-    return pv1JsonOutput_({
-      ok: false,
-      error: "Ação não reconhecida",
-      actionRecebida: action,
-      bodyRecebido: body
-    });
-  } catch (err) {
-    return pv1JsonOutput_({
-      ok: false,
-      error: String(err)
-    });
-  }
+function telegramFileUrl(filePath) {
+  return `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
 }
 
-/*********************************************************
- * PREENCHIMENTO REAL
- *********************************************************/
+async function sendTelegramMessage(chatId, text) {
+  return axios.post(telegramApiUrl("sendMessage"), {
+    chat_id: chatId,
+    text
+  });
+}
 
-function pv1PreencherLoteV1_(body) {
-  const pedidos = Array.isArray(body.pedidos) ? body.pedidos : [];
-  if (!pedidos.length) {
-    return { ok: false, error: "Nenhum pedido recebido" };
-  }
-
-  const forcarDuplicata = body && body.force_duplicate_confirmed === true;
-  const sh = pv1GetCentralSheet_();
-  const resultados = [];
-  const grupos = [];
-
-  for (let i = 0; i < pedidos.length; i++) {
-    const pedido = pedidos[i];
-
-    try {
-      const resolvido = pv1ResolverPedidoPreview_(pedido);
-
-      if (!resolvido.ok) {
-        resultados.push(resolvido);
-        continue;
-      }
-
-      const duplicatas = pv1BuscarDuplicatasRegistro_({
-        cliente_oficial: resolvido.cliente_oficial,
-        produto_oficial: resolvido.produto_oficial,
-        quantidade_gramas: resolvido.quantidade_gramas,
-        data_venda: resolvido.data_venda
-      });
-
-      if (duplicatas.length && !forcarDuplicata) {
-        resultados.push({
-          ok: false,
-          possible_duplicate: true,
-          erro: "Possível duplicata encontrada",
-          cliente_oficial: resolvido.cliente_oficial,
-          produto_oficial: resolvido.produto_oficial,
-          quantidade_gramas: resolvido.quantidade_gramas,
-          data_venda: resolvido.data_venda,
-          duplicatas: duplicatas
-        });
-        continue;
-      }
-
-      const grupoExistente = grupos.find(function(g) {
-        return (
-          g.cliente_oficial === resolvido.cliente_oficial &&
-          g.data_venda === resolvido.data_venda &&
-          g.vencimento === resolvido.vencimento &&
-          g.forma_pagamento === resolvido.forma_pagamento &&
-          g.itens.length < 4
-        );
-      });
-
-      if (grupoExistente) {
-        grupoExistente.itens.push(resolvido);
-      } else {
-        grupos.push({
-          cliente_oficial: resolvido.cliente_oficial,
-          data_venda: resolvido.data_venda,
-          vencimento: resolvido.vencimento,
-          forma_pagamento: resolvido.forma_pagamento,
-          itens: [resolvido]
-        });
-      }
-
-    } catch (err) {
-      resultados.push({
-        ok: false,
-        erro: String(err)
-      });
-    }
-  }
-
-  for (let g = 0; g < grupos.length; g++) {
-    const grupo = grupos[g];
-    const bloco = pv1EncontrarProximoBlocoLivre_(sh);
-
-    if (!bloco) {
-      grupo.itens.forEach(function(item) {
-        resultados.push({
-          ok: false,
-          erro: "Sem bloco livre na aba Central de Controle API",
-          cliente_oficial: item.cliente_oficial,
-          produto_oficial: item.produto_oficial
-        });
-      });
-      continue;
-    }
-
-    pv1PreencherGrupoNoBloco_(sh, bloco.baseRow, grupo);
-
-    grupo.itens.forEach(function(item, idx) {
-      const row = bloco.baseRow + idx;
-
-      const registro = pv1SalvarRegistroVendaDrive_({
-        cliente_oficial: item.cliente_oficial,
-        cliente_falado: item.cliente_falado,
-        produto_oficial: item.produto_oficial,
-        produto_falado: item.produto_falado,
-        quantidade_gramas: item.quantidade_gramas,
-        quantidade_sheet: item.quantidade_sheet,
-        data_venda: item.data_venda,
-        vencimento: item.vencimento,
-        forma_pagamento: item.forma_pagamento,
-        valor: item.valor,
-        origem: "telegram_v1",
-        observacoes: item.pedido_original && item.pedido_original.observacoes
-          ? item.pedido_original.observacoes
-          : null,
-        base_row: bloco.baseRow,
-        linha_item: row
-      });
-
-      pv1AnexarRegistroNaNotaLinha_(sh, row, registro);
-
-      resultados.push({
-        ok: true,
-        cliente_oficial: item.cliente_oficial,
-        produto_oficial: item.produto_oficial,
-        quantidade_gramas: item.quantidade_gramas,
-        quantidade_sheet: item.quantidade_sheet,
-        valor: item.valor,
-        data_venda: item.data_venda,
-        vencimento: item.vencimento,
-        forma_pagamento: item.forma_pagamento,
-        base_row: bloco.baseRow,
-        linha_item: row,
-        confianca_cliente: item.confianca_cliente,
-        confianca_produto: item.confianca_produto,
-        sugestao_cliente: item.sugestao_cliente || null,
-        registro_drive: registro
-      });
-    });
-  }
-
-  const hasPossibleDuplicate = resultados.some(function(r) {
-    return r && r.possible_duplicate;
+async function getTelegramFile(fileId) {
+  const resp = await axios.get(telegramApiUrl("getFile"), {
+    params: { file_id: fileId }
   });
 
-  return {
-    ok: resultados.some(function(r) { return r.ok; }),
-    possible_duplicate: hasPossibleDuplicate,
-    totalPedidos: pedidos.length,
-    totalSucesso: resultados.filter(function(r) { return r.ok; }).length,
-    totalFalha: resultados.filter(function(r) { return !r.ok; }).length,
-    resultados: resultados
-  };
-}
-
-/*********************************************************
- * PRÉVIA OFICIAL
- *********************************************************/
-
-function pv1PreviewLoteV1_(body) {
-  const pedidos = Array.isArray(body.pedidos) ? body.pedidos : [];
-  if (!pedidos.length) {
-    return { ok: false, error: "Nenhum pedido recebido" };
+  if (!resp.data?.ok || !resp.data?.result?.file_path) {
+    throw new Error("Não foi possível obter o file_path do Telegram.");
   }
 
-  const resultados = [];
-
-  for (let i = 0; i < pedidos.length; i++) {
-    const pedido = pedidos[i];
-
-    try {
-      const resolvido = pv1ResolverPedidoPreview_(pedido);
-      resultados.push(resolvido);
-    } catch (err) {
-      resultados.push({
-        ok: false,
-        erro: String(err)
-      });
-    }
-  }
-
-  return {
-    ok: resultados.some(function(r) { return r.ok; }),
-    totalPedidos: pedidos.length,
-    totalSucesso: resultados.filter(function(r) { return r.ok; }).length,
-    totalFalha: resultados.filter(function(r) { return !r.ok; }).length,
-    resultados: resultados
-  };
+  return resp.data.result;
 }
 
-function pv1ResolverPedidoPreview_(pedido) {
-  const clienteResolvido = pv1ResolverClienteComIA_(pedido.cliente_falado || "");
-  const produtoResolvido = pv1ResolverProdutoComIA_(pedido.produto_falado || "");
-  const dataVenda = pv1ResolverData_(pedido.data_falada || null);
-  const quantidadeGramas = pv1ConverterQuantidadeParaGramas_(
-    pedido.quantidade,
-    pedido.unidade
+async function downloadTelegramFileBuffer(filePath) {
+  const resp = await axios.get(telegramFileUrl(filePath), {
+    responseType: "arraybuffer"
+  });
+
+  return Buffer.from(resp.data);
+}
+
+async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
+  const form = new FormData();
+  form.append("file", buffer, filename);
+
+  // Modelo mais forte de transcrição
+  form.append("model", "gpt-4o-transcribe");
+
+  // Idioma esperado
+  form.append("language", "pt");
+
+  // Vocabulário útil do seu negócio
+  form.append(
+    "prompt",
+    [
+      "Transcrição em português do Brasil.",
+      "Nomes frequentes de clientes:",
+      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia.",
+      "Produtos frequentes:",
+      "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
+      "Medidas frequentes:",
+      "55cm, 60/65cm, 65/70cm, 70/75cm.",
+      "Se houver nomes próprios raros, tente preservar a forma fonética mais próxima possível."
+    ].join(" ")
   );
-  const quantidadeSheet = pv1ConverterGramasParaValorSheet_(quantidadeGramas);
-  const formaPagamento = pv1ResolverFormaPagamento_(pedido.forma_pagamento_falada || null);
-  const vencimento = pv1ResolverVencimento_(pedido.vencimento_falado || null, dataVenda);
-  const valor = pedido.valor_falado != null && isFinite(Number(pedido.valor_falado))
-    ? Number(pedido.valor_falado)
-    : null;
 
-  if (!clienteResolvido.ok) {
-    return {
-      ok: false,
-      erro: "Cliente não resolvido",
-      cliente_falado: pedido.cliente_falado || null,
-      detalhe: clienteResolvido
-    };
+  const resp = await axios.post(
+    "https://api.openai.com/v1/audio/transcriptions",
+    form,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        ...form.getHeaders()
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    }
+  );
+
+  return resp.data?.text || "";
+}
+
+function normalizeText(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isConfirmationText(text) {
+  const t = normalizeText(text);
+
+  return (
+    t === "sim" ||
+    t === "ok" ||
+    t === "certo" ||
+    t === "isso" ||
+    t === "confirmar" ||
+    t === "pode confirmar" ||
+    t === "confirme" ||
+    t === "confirmar sim" ||
+    t === "confirme tudo" ||
+    t === "confirmar duplicata"
+  );
+}
+
+function isCancelText(text) {
+  const t = normalizeText(text);
+
+  return (
+    t === "cancelar" ||
+    t === "cancelar lote" ||
+    t === "limpar" ||
+    t === "limpar lote" ||
+    t === "comecar de novo" ||
+    t === "recomecar" ||
+    t === "apagar lote"
+  );
+}
+
+function looksLikeFreshOrderMessage(text) {
+  const t = normalizeText(text);
+
+  return (
+    t.includes("comprou") ||
+    t.includes("pedido") ||
+    /\b\d+(?:[.,]\d+)?\s*(g|kg)\b/.test(t) ||
+    /\br\$\s*\d+/.test(t) ||
+    t.includes("valor") ||
+    t.includes("vence") ||
+    t.includes("vencimento") ||
+    t.includes("no dia")
+  );
+}
+
+function cloneExtraction(extraction) {
+  return JSON.parse(JSON.stringify(extraction || { pedidos: [] }));
+}
+
+function savePendingBatch(chatId, extraction, meta = {}) {
+  pendingBatches.set(String(chatId), {
+    extraction,
+    meta,
+    createdAt: new Date().toISOString()
+  });
+}
+
+function getPendingBatch(chatId) {
+  return pendingBatches.get(String(chatId)) || null;
+}
+
+function clearPendingBatch(chatId) {
+  pendingBatches.delete(String(chatId));
+}
+
+function parseBrazilianNumber(str) {
+  if (str == null) return null;
+  const cleaned = String(str).trim().replace(/\./g, "").replace(",", ".");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatDateToIso(date) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function normalizeDateValue(rawText) {
+  const original = String(rawText || "").trim();
+  if (!original) return null;
+
+  const t = normalizeText(original);
+  const now = new Date();
+
+  if (t === "hoje") {
+    return formatDateToIso(now);
   }
 
-  if (!produtoResolvido.ok) {
-    return {
-      ok: false,
-      erro: "Produto não resolvido",
-      produto_falado: pedido.produto_falado || null,
-      detalhe: produtoResolvido
-    };
+  if (t === "ontem") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    return formatDateToIso(d);
   }
 
-  if (!quantidadeGramas || !isFinite(quantidadeGramas) || quantidadeGramas <= 0) {
-    return {
-      ok: false,
-      erro: "Quantidade inválida",
-      quantidade: pedido.quantidade,
-      unidade: pedido.unidade
-    };
+  if (t === "antes de ontem") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 2);
+    return formatDateToIso(d);
   }
 
+  let m = original.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    return `${m[1]}-${m[2]}-${m[3]}`;
+  }
+
+  m = original.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yyyy = String(m[3]);
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  m = original.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yyyy = String(now.getFullYear());
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  return original;
+}
+
+function normalizeSinglePedido(pedido) {
+  const out = { ...(pedido || {}) };
+
+  if (out.quantidade != null && Number.isFinite(Number(out.quantidade))) {
+    out.quantidade = Number(out.quantidade);
+  }
+
+  if (out.valor_falado != null && Number.isFinite(Number(out.valor_falado))) {
+    out.valor_falado = Number(out.valor_falado);
+  }
+
+  if (out.data_falada) {
+    out.data_falada = normalizeDateValue(out.data_falada);
+  }
+
+  if (out.vencimento_falado) {
+    out.vencimento_falado = normalizeDateValue(out.vencimento_falado);
+  }
+
+  return out;
+}
+
+function normalizeExtraction(extraction) {
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
   return {
-    ok: true,
-    pedido_original: pedido,
-    cliente_oficial: clienteResolvido.cliente_oficial,
-    cliente_falado: pedido.cliente_falado || null,
-    produto_oficial: produtoResolvido.produto_oficial,
-    produto_falado: pedido.produto_falado || null,
-    quantidade_gramas: quantidadeGramas,
-    quantidade_sheet: quantidadeSheet,
-    valor: valor,
-    data_venda: dataVenda,
-    vencimento: vencimento,
-    forma_pagamento: formaPagamento,
-    confianca_cliente: clienteResolvido.confianca || null,
-    confianca_produto: produtoResolvido.confianca || null,
-    sugestao_cliente: clienteResolvido.sugestao_texto || null
+    ...extraction,
+    pedidos: pedidos.map(normalizeSinglePedido)
   };
 }
 
-/*********************************************************
- * REMOÇÃO DE PREENCHIMENTOS
- *********************************************************/
+function parsePaymentText(rawText) {
+  const t = normalizeText(rawText);
 
-function pv1DeletePreenchimentosV1_(body) {
-  const sh = pv1GetCentralSheet_();
-  const modo = String(body.mode || "").trim();
-  const indices = Array.isArray(body.indices) ? body.indices.map(Number).filter(Boolean) : [];
-
-  let basesParaApagar = [];
-
-  if (modo === "all") {
-    basesParaApagar = pv1ListarBlocosPreenchidos_(sh).map(function(x) { return x.baseRow; });
-  } else if (modo === "last") {
-    const preenchidos = pv1ListarBlocosPreenchidos_(sh);
-    if (preenchidos.length) {
-      basesParaApagar = [preenchidos[preenchidos.length - 1].baseRow];
-    }
-  } else if (modo === "specific") {
-    const preenchidos = pv1ListarBlocosPreenchidos_(sh);
-    basesParaApagar = indices
-      .map(function(n) {
-        const item = preenchidos.find(function(x) { return x.index === n; });
-        return item ? item.baseRow : null;
-      })
-      .filter(Boolean);
-  }
-
-  if (!basesParaApagar.length) {
-    return {
-      ok: false,
-      error: "Nenhum preenchimento encontrado para remover."
-    };
-  }
-
-  const resultados = [];
-
-  for (let i = 0; i < basesParaApagar.length; i++) {
-    const baseRow = basesParaApagar[i];
-
-    const cliente = String(sh.getRange("C" + baseRow).getDisplayValue() || "").trim();
-    const data = String(sh.getRange("E" + baseRow).getDisplayValue() || "").trim();
-
-    const produtos = [];
-    const arquivosRemovidos = [];
-
-    for (let j = 0; j < 4; j++) {
-      const row = baseRow + j;
-      const produto = String(sh.getRange("G" + row).getDisplayValue() || "").trim();
-      if (produto) produtos.push(produto);
-
-      const removidosLinha = pv1RemoverLogsDaLinhaPorNota_(sh, row);
-      for (let k = 0; k < removidosLinha.length; k++) {
-        arquivosRemovidos.push(removidosLinha[k]);
-      }
-    }
-
-    pv1LimparBloco_(sh, baseRow);
-
-    resultados.push({
-      ok: true,
-      base_row: baseRow,
-      cliente: cliente || null,
-      data: data || null,
-      produtos: produtos,
-      arquivos_removidos: arquivosRemovidos
-    });
-  }
-
-  return {
-    ok: true,
-    totalRemovido: resultados.length,
-    resultados: resultados
-  };
-}
-
-/*********************************************************
- * BLOCO / PLANILHA
- *********************************************************/
-
-function pv1GetSpreadsheet_() {
-  return SpreadsheetApp.openById(PV1_SPREADSHEET_ID);
-}
-
-function pv1GetCentralSheet_() {
-  const ss = pv1GetSpreadsheet_();
-  const sh = ss.getSheetByName("Central de Controle API");
-  if (!sh) throw new Error('Aba "Central de Controle API" não encontrada.');
-  return sh;
-}
-
-function pv1GetMapaClientesSheet_() {
-  const ss = pv1GetSpreadsheet_();
-  const sh = ss.getSheetByName("MAPA_CLIENTES");
-  if (!sh) throw new Error('Aba "MAPA_CLIENTES" não encontrada.');
-  return sh;
-}
-
-function pv1GetBaseRows_() {
-  return [50, 54, 58, 62, 66, 70, 74, 78, 82];
-}
-
-function pv1EncontrarProximoBlocoLivre_(sh) {
-  const bases = pv1GetBaseRows_();
-
-  for (let i = 0; i < bases.length; i++) {
-    const baseRow = bases[i];
-    const cliente = String(sh.getRange("C" + baseRow).getDisplayValue() || "").trim();
-
-    let ocupado = !!cliente;
-    for (let j = 0; j < 4; j++) {
-      const r = baseRow + j;
-      const produto = String(sh.getRange("G" + r).getDisplayValue() || "").trim();
-      const quant = String(sh.getRange("I" + r).getDisplayValue() || "").trim();
-      if (produto || quant) {
-        ocupado = true;
-        break;
-      }
-    }
-
-    if (!ocupado) {
-      return { baseRow: baseRow };
-    }
-  }
+  if (t.includes("pix")) return "PIX";
+  if (t.includes("dinheiro")) return "Dinheiro à Vista";
+  if (t.includes("a vista") || t.includes("avista")) return "Dinheiro à Vista";
 
   return null;
 }
 
-function pv1PreencherGrupoNoBloco_(sh, baseRow, grupo) {
-  const itens = Array.isArray(grupo.itens) ? grupo.itens : [];
-  if (!itens.length) return;
+function inferGlobalContextFromText(text) {
+  const original = String(text || "").trim();
+  const normalized = normalizeText(original);
 
-  sh.getRange("C" + baseRow).setValue(grupo.cliente_oficial);
-  sh.getRange("E" + baseRow).setValue(grupo.data_venda);
-  sh.getRange("M" + baseRow).setValue(grupo.vencimento);
-  sh.getRange("O" + baseRow).setValue(grupo.forma_pagamento);
-
-  for (let i = 0; i < itens.length; i++) {
-    const row = baseRow + i;
-    const item = itens[i];
-
-    sh.getRange("G" + row).setValue(item.produto_oficial);
-    sh.getRange("I" + row).setValue(item.quantidade_sheet);
-    sh.getRange("I" + row).setNumberFormat("0.000");
-
-    if (item.valor != null && isFinite(item.valor)) {
-      sh.getRange("K" + row).setValue(Number(item.valor));
-      sh.getRange("K" + row).setNumberFormat("0.00");
-    } else {
-      sh.getRange("K" + row).clearContent();
-    }
-
-    const nota = [
-      "Origem: Telegram V1",
-      "Cliente oficial: " + item.cliente_oficial,
-      "Produto oficial: " + item.produto_oficial,
-      "Quantidade (g): " + item.quantidade_gramas,
-      "Quantidade (sheet): " + item.quantidade_sheet,
-      "Valor: " + (item.valor != null ? item.valor : ""),
-      "Data: " + item.data_venda,
-      "Vencimento: " + item.vencimento,
-      "Forma de pagamento: " + item.forma_pagamento,
-      "Pedido original: " + JSON.stringify(item.pedido_original || {})
-    ].join("\n");
-
-    sh.getRange("G" + row).setNote(nota);
-  }
-}
-
-function pv1AnexarRegistroNaNotaLinha_(sh, row, registro) {
-  const cell = sh.getRange("G" + row);
-  const notaAtual = String(cell.getNote() || "").trim();
-
-  const extra = [
-    "Registro Drive ID: " + (registro.id_venda || ""),
-    "Registro Drive File ID: " + (registro.file_id || ""),
-    "Registro Drive Nome: " + (registro.nome_arquivo || "")
-  ].join("\n");
-
-  cell.setNote(notaAtual ? (notaAtual + "\n" + extra) : extra);
-}
-
-function pv1ListarBlocosPreenchidos_(sh) {
-  const bases = pv1GetBaseRows_();
-  const out = [];
-
-  for (let i = 0; i < bases.length; i++) {
-    const baseRow = bases[i];
-    const cliente = String(sh.getRange("C" + baseRow).getDisplayValue() || "").trim();
-
-    let ocupado = !!cliente;
-    for (let j = 0; j < 4; j++) {
-      const row = baseRow + j;
-      const produto = String(sh.getRange("G" + row).getDisplayValue() || "").trim();
-      const quant = String(sh.getRange("I" + row).getDisplayValue() || "").trim();
-      if (produto || quant) {
-        ocupado = true;
-        break;
-      }
-    }
-
-    if (ocupado) {
-      out.push({
-        index: out.length + 1,
-        baseRow: baseRow
-      });
-    }
-  }
-
-  return out;
-}
-
-function pv1LimparBloco_(sh, baseRow) {
-  sh.getRange("C" + baseRow).clearContent();
-  sh.getRange("E" + baseRow).clearContent();
-  sh.getRange("M" + baseRow).clearContent();
-  sh.getRange("O" + baseRow).clearContent();
-
-  for (let i = 0; i < 4; i++) {
-    const row = baseRow + i;
-    sh.getRange("G" + row).clearContent().clearNote();
-    sh.getRange("I" + row).clearContent();
-    sh.getRange("K" + row).clearContent();
-  }
-}
-
-/*********************************************************
- * LOGS DRIVE
- *********************************************************/
-
-function pv1SalvarRegistroVendaDrive_(dados) {
-  const root = DriveApp.getFolderById(PV1_DRIVE_REGISTRO_VENDAS_FOLDER_ID);
-  const data = new Date(dados.data_venda + "T12:00:00");
-
-  const cliente = pv1SanitizeFileName_(dados.cliente_oficial || "SEM_CLIENTE");
-  const ano = Utilities.formatDate(data, Session.getScriptTimeZone(), "yyyy");
-  const mes = pv1NomeMesPt_(data);
-
-  const pastaCliente = pv1GetOrCreateSubFolder_(root, cliente);
-  const pastaAno = pv1GetOrCreateSubFolder_(pastaCliente, ano);
-  const pastaMes = pv1GetOrCreateSubFolder_(pastaAno, mes);
-
-  const idVenda = "PV1_" + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss_SSS");
-  const nomeArquivo = [
-    cliente,
-    dados.data_venda,
-    String(dados.quantidade_gramas) + "g",
-    pv1SanitizeFileName_(dados.produto_oficial || "SEM_PRODUTO"),
-    idVenda
-  ].join("__") + ".json";
-
-  const payload = {
-    id_venda: idVenda,
-    data_venda: dados.data_venda,
-    cliente_oficial: dados.cliente_oficial,
-    cliente_falado: dados.cliente_falado,
-    produto_oficial: dados.produto_oficial,
-    produto_falado: dados.produto_falado,
-    quantidade_gramas: dados.quantidade_gramas,
-    quantidade_sheet: dados.quantidade_sheet,
-    valor: dados.valor,
-    origem: dados.origem,
-    observacoes: dados.observacoes,
-    base_row: dados.base_row,
-    linha_item: dados.linha_item || null,
-    forma_pagamento: dados.forma_pagamento || "PIX",
-    vencimento: dados.vencimento || null,
-    criado_em: new Date().toISOString()
+  const context = {
+    cliente_falado: null,
+    data_falada: null,
+    vencimento_falado: null,
+    forma_pagamento_falada: null
   };
 
-  const file = pastaMes.createFile(
-    nomeArquivo,
-    JSON.stringify(payload, null, 2),
-    MimeType.PLAIN_TEXT
-  );
+  const payment = parsePaymentText(original);
+  if (payment) {
+    context.forma_pagamento_falada = payment;
+  }
 
-  return {
-    id_venda: idVenda,
-    nome_arquivo: nomeArquivo,
-    file_id: file.getId()
-  };
-}
+  const explicitDates = [];
 
-function pv1RemoverLogsDaLinhaPorNota_(sh, row) {
-  const note = String(sh.getRange("G" + row).getNote() || "");
-  const removidos = [];
+  const reFull = /\b(\d{1,2}\/\d{1,2}\/\d{4})\b/g;
+  let m;
+  while ((m = reFull.exec(original)) !== null) {
+    explicitDates.push(normalizeDateValue(m[1]));
+  }
 
-  const matches = [...note.matchAll(/Registro Drive File ID:\s*([A-Za-z0-9\-_]+)/g)];
-  for (let i = 0; i < matches.length; i++) {
-    const fileId = String(matches[i][1] || "").trim();
-    if (!fileId) continue;
+  const reShort = /\b(\d{1,2}\/\d{1,2})\b/g;
+  while ((m = reShort.exec(original)) !== null) {
+    explicitDates.push(normalizeDateValue(m[1]));
+  }
 
-    try {
-      const file = DriveApp.getFileById(fileId);
-      removidos.push({
-        file_id: fileId,
-        nome_arquivo: file.getName()
-      });
-      file.setTrashed(true);
-    } catch (err) {
-      removidos.push({
-        file_id: fileId,
-        nome_arquivo: null,
-        erro: String(err)
-      });
+  if (normalized.includes("antes de ontem")) {
+    explicitDates.push(normalizeDateValue("antes de ontem"));
+  } else if (normalized.includes("ontem")) {
+    explicitDates.push(normalizeDateValue("ontem"));
+  } else if (normalized.includes("hoje")) {
+    explicitDates.push(normalizeDateValue("hoje"));
+  }
+
+  const uniqueDates = [...new Set(explicitDates.filter(Boolean))];
+  if (uniqueDates.length === 1) {
+    context.data_falada = uniqueDates[0];
+  }
+
+  const duePatterns = [
+    /\bvence(?:\s+no)?\s+dia\s+(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i,
+    /\bvencimento\s+(?:dia\s+)?(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i,
+    /\bvence\s+(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i
+  ];
+
+  for (const re of duePatterns) {
+    const match = original.match(re);
+    if (match) {
+      context.vencimento_falado = normalizeDateValue(match[1]);
+      break;
     }
   }
 
-  return removidos;
-}
+  const clientePattern =
+    original.match(/^\s*([A-Za-zÀ-ÿ'’\-]+)\s+comprou\b/i);
 
-function pv1BuscarDuplicatasRegistro_(filtro) {
-  const root = DriveApp.getFolderById(PV1_DRIVE_REGISTRO_VENDAS_FOLDER_ID);
-  const cliente = pv1SanitizeFileName_(filtro.cliente_oficial || "");
-  if (!cliente) return [];
-
-  const ano = String(filtro.data_venda || "").slice(0, 4);
-  if (!ano) return [];
-
-  const dataBase = new Date(filtro.data_venda + "T12:00:00");
-  const mes = pv1NomeMesPt_(dataBase);
-
-  const pastaCliente = pv1FindSubFolderByName_(root, cliente);
-  if (!pastaCliente) return [];
-
-  const pastaAno = pv1FindSubFolderByName_(pastaCliente, ano);
-  if (!pastaAno) return [];
-
-  const pastaMes = pv1FindSubFolderByName_(pastaAno, mes);
-  if (!pastaMes) return [];
-
-  const files = pastaMes.getFiles();
-  const duplicatas = [];
-
-  while (files.hasNext()) {
-    const file = files.next();
-
-    try {
-      const raw = file.getBlob().getDataAsString();
-      const json = JSON.parse(raw);
-
-      const mesmoCliente =
-        pv1Norm_(json.cliente_oficial || "") === pv1Norm_(filtro.cliente_oficial || "");
-      const mesmoProduto =
-        pv1Norm_(json.produto_oficial || "") === pv1Norm_(filtro.produto_oficial || "");
-      const mesmaQuantidade =
-        Number(json.quantidade_gramas || 0) === Number(filtro.quantidade_gramas || 0);
-      const mesmaData =
-        String(json.data_venda || "") === String(filtro.data_venda || "");
-
-      if (mesmoCliente && mesmoProduto && mesmaQuantidade && mesmaData) {
-        duplicatas.push({
-          id_venda: json.id_venda || null,
-          cliente_oficial: json.cliente_oficial || null,
-          produto_oficial: json.produto_oficial || null,
-          quantidade_gramas: json.quantidade_gramas || null,
-          data_venda: json.data_venda || null,
-          valor: json.valor || null,
-          file_id: file.getId(),
-          nome_arquivo: file.getName()
-        });
-      }
-    } catch (err) {}
+  if (clientePattern) {
+    context.cliente_falado = String(clientePattern[1] || "").trim() || null;
   }
 
-  return duplicatas;
+  return context;
 }
 
-function pv1GetOrCreateSubFolder_(parent, nome) {
-  const it = parent.getFoldersByName(nome);
-  if (it.hasNext()) return it.next();
-  return parent.createFolder(nome);
-}
+function applyBatchContextDefaults(extraction, rawText) {
+  const normalizedExtraction = normalizeExtraction(extraction);
+  const pedidos = Array.isArray(normalizedExtraction?.pedidos)
+    ? normalizedExtraction.pedidos
+    : [];
 
-function pv1FindSubFolderByName_(parent, nome) {
-  const it = parent.getFoldersByName(nome);
-  if (it.hasNext()) return it.next();
-  return null;
-}
+  if (!pedidos.length) return normalizedExtraction;
 
-/*********************************************************
- * CLIENTE COM IA
- *********************************************************/
+  const globalContext = inferGlobalContextFromText(rawText);
 
-function pv1ListarMapaClientes_() {
-  const sh = pv1GetMapaClientesSheet_();
-  const lastRow = sh.getLastRow();
-  if (lastRow < 2) return [];
+  const filled = pedidos.map((pedido) => {
+    const out = { ...pedido };
 
-  const vals = sh.getRange(2, 1, lastRow - 1, 13).getDisplayValues();
-  const out = [];
-
-  for (let i = 0; i < vals.length; i++) {
-    const row = vals[i];
-    const bases = [];
-
-    for (let c = 0; c < 10; c++) {
-      bases.push(String(row[c] || "").trim());
+    if (!out.cliente_falado && globalContext.cliente_falado) {
+      out.cliente_falado = globalContext.cliente_falado;
     }
 
-    const cliente = String(row[10] || "").trim();
-    const ativo = pv1Norm_(row[12] || "");
-
-    if (!cliente) continue;
-    if (ativo && !["sim", "s", "ativo", "1", "true"].includes(ativo)) continue;
-
-    out.push({
-      rowNumber: i + 2,
-      nome_bases: bases.filter(Boolean),
-      cliente_oficial: cliente
-    });
-  }
-
-  return out;
-}
-
-function pv1ResolverClienteComIA_(nomeFalado) {
-  const nomeLimpo = String(nomeFalado || "").trim();
-  const nomeNorm = pv1Norm_(nomeLimpo);
-
-  if (!nomeNorm) {
-    return { ok: false, motivo: "Nome do cliente vazio" };
-  }
-
-  const mapa = pv1ListarMapaClientes_();
-  if (!mapa.length) {
-    return { ok: false, motivo: "MAPA_CLIENTES vazio" };
-  }
-
-  for (let i = 0; i < mapa.length; i++) {
-    const item = mapa[i];
-    for (let j = 0; j < item.nome_bases.length; j++) {
-      const base = item.nome_bases[j];
-      if (pv1Norm_(base) === nomeNorm) {
-        return {
-          ok: true,
-          cliente_oficial: item.cliente_oficial,
-          confianca: 1,
-          motivo: "match exato nome_base"
-        };
-      }
+    if (!out.data_falada && globalContext.data_falada) {
+      out.data_falada = globalContext.data_falada;
     }
-  }
 
-  for (let i = 0; i < mapa.length; i++) {
-    const item = mapa[i];
-    if (pv1Norm_(item.cliente_oficial) === nomeNorm) {
-      return {
-        ok: true,
-        cliente_oficial: item.cliente_oficial,
-        confianca: 0.99,
-        motivo: "match exato cliente_oficial"
-      };
+    if (!out.vencimento_falado && globalContext.vencimento_falado) {
+      out.vencimento_falado = globalContext.vencimento_falado;
     }
-  }
 
-  const candidatos = [];
-  for (let i = 0; i < mapa.length; i++) {
-    const item = mapa[i];
-    const comparacoes = item.nome_bases.concat([item.cliente_oficial]).filter(Boolean);
-
-    for (let j = 0; j < comparacoes.length; j++) {
-      const comp = comparacoes[j];
-      const score = pv1ScoreTexto_(nomeNorm, pv1Norm_(comp));
-      candidatos.push({
-        cliente_oficial: item.cliente_oficial,
-        comparado_com: comp,
-        score: score
-      });
+    if (!out.forma_pagamento_falada && globalContext.forma_pagamento_falada) {
+      out.forma_pagamento_falada = globalContext.forma_pagamento_falada;
     }
-  }
 
-  candidatos.sort(function(a, b) { return b.score - a.score; });
-
-  const top1 = candidatos[0];
-
-  if (top1 && top1.score >= 0.90) {
-    return {
-      ok: true,
-      cliente_oficial: top1.cliente_oficial,
-      confianca: top1.score,
-      motivo: "fuzzy alto"
-    };
-  }
-
-  const respIA = pv1ResolverClienteIA_(nomeLimpo, mapa);
-
-  if (!respIA || respIA.ok !== true) {
-    return {
-      ok: false,
-      motivo: respIA && respIA.motivo ? respIA.motivo : "IA não conseguiu resolver cliente",
-      resposta_ia: respIA || null
-    };
-  }
-
-  let escolhido = null;
-
-  if (respIA.cliente_index != null && isFinite(Number(respIA.cliente_index))) {
-    const idx = Number(respIA.cliente_index) - 1;
-    if (idx >= 0 && idx < mapa.length) {
-      escolhido = mapa[idx].cliente_oficial;
-    }
-  }
-
-  if (!escolhido && respIA.cliente_oficial) {
-    const achado = mapa.find(function(x) {
-      return pv1Norm_(x.cliente_oficial) === pv1Norm_(respIA.cliente_oficial);
-    });
-    escolhido = achado ? achado.cliente_oficial : null;
-  }
-
-  if (!escolhido) {
-    return {
-      ok: false,
-      motivo: "IA retornou cliente fora da lista oficial",
-      resposta_ia: respIA
-    };
-  }
-
-  const confianca = respIA.confianca != null ? Number(respIA.confianca) : null;
-  if (confianca != null && confianca < 0.60) {
-    return {
-      ok: false,
-      motivo: "Cliente ambíguo com baixa confiança",
-      resposta_ia: respIA
-    };
-  }
-
-  return {
-    ok: true,
-    cliente_oficial: escolhido,
-    confianca: confianca,
-    sugestao_texto: confianca != null && confianca < 0.85 ? ("Você quis dizer " + escolhido + "?") : null,
-    motivo: respIA.motivo || "IA"
-  };
-}
-
-function pv1ResolverClienteIA_(nomeFalado, mapa) {
-  const linhas = mapa.map(function(item, i) {
-    return [
-      (i + 1) + ". Cliente oficial: " + item.cliente_oficial,
-      "Aliases: " + (item.nome_bases.length ? item.nome_bases.join(" | ") : "(sem aliases)")
-    ].join("\n");
-  }).join("\n\n");
-
-  const prompt = [
-    "Você é um resolvedor de cliente oficial.",
-    "Escolha o cliente oficial mais provável a partir da lista fornecida.",
-    "Considere erros de fala, transcrição, nomes próprios raros, sílabas trocadas e grafias aproximadas.",
-    "RETORNE o cliente oficial exatamente como está na lista.",
-    "Também retorne o índice do cliente escolhido.",
-    "Se houver cliente suficientemente provável, retorne ok=true.",
-    "Se estiver ambíguo ou fraco, retorne ok=false.",
-    "",
-    "Retorne SOMENTE JSON válido neste formato:",
-    "{",
-    '  "ok": true ou false,',
-    '  "cliente_index": number ou null,',
-    '  "cliente_oficial": "string ou null",',
-    '  "confianca": number,',
-    '  "motivo": "string"',
-    "}",
-    "",
-    "Nome falado:",
-    nomeFalado,
-    "",
-    "Lista oficial de clientes:",
-    linhas
-  ].join("\n");
-
-  return pv1OpenAIJson_(prompt);
-}
-
-/*********************************************************
- * PRODUTO COM IA
- *********************************************************/
-
-function pv1ListarProdutosColunaQ_() {
-  const sh = pv1GetMapaClientesSheet_();
-  const lastRow = sh.getLastRow();
-  if (lastRow < 2) return [];
-
-  const vals = sh.getRange(2, 17, lastRow - 1, 1).getDisplayValues();
-  const unicos = {};
-  const out = [];
-
-  vals.forEach(function(r) {
-    const nome = String(r[0] || "").trim();
-    if (!nome) return;
-    const key = pv1Norm_(nome);
-    if (unicos[key]) return;
-    unicos[key] = true;
-    out.push(nome);
+    return normalizeSinglePedido(out);
   });
 
-  return out;
-}
-
-function pv1ResolverProdutoComIA_(produtoFalado) {
-  const produto = String(produtoFalado || "").trim();
-  if (!produto) {
-    return { ok: false, motivo: "Produto vazio" };
-  }
-
-  const produtos = pv1ListarProdutosColunaQ_();
-  if (!produtos.length) {
-    return { ok: false, motivo: "Lista de produtos da coluna Q vazia" };
-  }
-
-  const prompt = [
-    "Você é um resolvedor de produto oficial.",
-    "Escolha o produto oficial mais provável a partir da lista fornecida.",
-    "Considere erros de fala, transcrição, palavras coladas, números por extenso, cm, faixas como 60/65cm.",
-    "RETORNE o produto exatamente como está na lista oficial.",
-    "Também retorne o índice do item escolhido.",
-    "Se houver produto suficientemente provável, retorne ok=true.",
-    "Se estiver ambíguo ou fraco, retorne ok=false.",
-    "",
-    "Retorne SOMENTE JSON válido neste formato:",
-    "{",
-    '  "ok": true ou false,',
-    '  "produto_index": number ou null,',
-    '  "produto_oficial": "string ou null",',
-    '  "confianca": number,',
-    '  "motivo": "string"',
-    "}",
-    "",
-    "Produto falado:",
-    produto,
-    "",
-    "Lista de produtos oficiais:",
-    produtos.map(function(p, i) { return (i + 1) + ". " + p; }).join("\n")
-  ].join("\n");
-
-  const resp = pv1OpenAIJson_(prompt);
-
-  if (!resp || resp.ok !== true) {
-    return {
-      ok: false,
-      motivo: resp && resp.motivo ? resp.motivo : "IA não conseguiu resolver",
-      resposta_ia: resp || null
-    };
-  }
-
-  let escolhido = null;
-
-  if (resp.produto_index != null && isFinite(Number(resp.produto_index))) {
-    const idx = Number(resp.produto_index) - 1;
-    if (idx >= 0 && idx < produtos.length) {
-      escolhido = produtos[idx];
-    }
-  }
-
-  if (!escolhido && resp.produto_oficial) {
-    escolhido = produtos.find(function(p) {
-      return pv1Norm_(p) === pv1Norm_(resp.produto_oficial);
-    }) || null;
-  }
-
-  if (!escolhido) {
-    return {
-      ok: false,
-      motivo: "IA retornou produto fora da lista oficial",
-      resposta_ia: resp
-    };
-  }
-
   return {
-    ok: true,
-    produto_oficial: escolhido,
-    confianca: resp.confianca != null ? Number(resp.confianca) : null,
-    motivo: resp.motivo || "IA"
+    ...normalizedExtraction,
+    pedidos: filled
   };
 }
 
-/*********************************************************
- * OPENAI
- *********************************************************/
+async function extractOrdersFromText(text) {
+  const prompt = `
+Você é um extrator de pedidos de vendas em português do Brasil.
 
-function pv1OpenAIJson_(prompt) {
-  const apiKey = PropertiesService.getScriptProperties().getProperty("OPENAI_API_KEY");
-  if (!apiKey) {
-    throw new Error("Falta Script Property OPENAI_API_KEY");
-  }
+Converta a mensagem do usuário em JSON.
+A mensagem pode conter de 1 a 10 pedidos.
+Pode haver pedidos do mesmo cliente ou de clientes diferentes na mesma mensagem.
+Se não houver clareza suficiente, ainda tente extrair o máximo com cautela.
 
-  const resp = UrlFetchApp.fetch("https://api.openai.com/v1/chat/completions", {
-    method: "post",
-    contentType: "application/json",
-    muteHttpExceptions: true,
-    headers: {
-      Authorization: "Bearer " + apiKey
-    },
-    payload: JSON.stringify({
+Regras:
+- Se a quantidade vier em kg, preserve unidade = "kg".
+- Se a quantidade vier em g/gramas, preserve unidade = "g".
+- Se o usuário disser um valor por extenso, converta para número.
+  Exemplo: "dois mil duzentos e cinquenta" => 2250
+- Se o usuário disser data da compra como "18/04", preserve "18/04".
+- Se o usuário disser "ontem", "antes de ontem" ou "hoje", preserve esse texto em data_falada.
+- Se a forma de pagamento não for dita, retorne null.
+- Se o vencimento não for dito, retorne null.
+- Se um mesmo contexto geral de data, cliente, vencimento ou pagamento parecer valer para vários pedidos, ainda assim extraia pedido por pedido e preserve o máximo possível.
+- Retorne SOMENTE JSON válido.
+
+Formato exato:
+
+{
+  "pedidos": [
+    {
+      "cliente_falado": "string ou null",
+      "produto_falado": "string ou null",
+      "quantidade": number ou null,
+      "unidade": "g|kg|un|null",
+      "data_falada": "string ou null",
+      "valor_falado": number ou null,
+      "forma_pagamento_falada": "PIX|Dinheiro à Vista|string|null",
+      "vencimento_falado": "string ou null",
+      "observacoes": "string ou null"
+    }
+  ]
+}
+
+Mensagem:
+${text}
+`.trim();
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
       model: "gpt-4.1-mini",
       messages: [
         {
           role: "system",
-          content: "Responda apenas JSON válido, sem markdown, sem comentário, sem texto extra."
+          content:
+            "Você extrai pedidos comerciais e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
         },
         {
           role: "user",
@@ -1000,248 +430,850 @@ function pv1OpenAIJson_(prompt) {
       ],
       temperature: 0,
       response_format: { type: "json_object" }
-    })
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      }
+    }
+  );
+
+  const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
+  console.log("Resposta bruta da OpenAI extractOrdersFromText:", content);
+
+  try {
+    const parsed = JSON.parse(content);
+    return applyBatchContextDefaults(parsed, text);
+  } catch (err) {
+    return { pedidos: [], erro_parse: true, conteudo_bruto: content };
+  }
+}
+
+function summarizeOrders(extraction) {
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
+
+  if (!pedidos.length) {
+    return "Não consegui extrair pedidos com segurança ainda.";
+  }
+
+  const linhas = pedidos.map((p, i) => {
+    const qtd = p.quantidade != null ? String(p.quantidade) : "?";
+    const unidade = p.unidade || "";
+    const produto = p.produto_falado || "produto não identificado";
+    const cliente = p.cliente_falado || "cliente não identificado";
+    const data = p.data_falada ? ` | data: ${p.data_falada}` : "";
+    const forma = p.forma_pagamento_falada ? ` | forma: ${p.forma_pagamento_falada}` : "";
+    const venc = p.vencimento_falado ? ` | vencimento: ${p.vencimento_falado}` : "";
+    const valor = p.valor_falado != null ? ` | valor: ${p.valor_falado}` : "";
+
+    return `${i + 1}. ${qtd}${unidade} de ${produto} para ${cliente}${data}${forma}${venc}${valor}`;
   });
 
-  const code = resp.getResponseCode();
-  const text = resp.getContentText();
+  return `Entendi estes pedidos:\n\n${linhas.join("\n")}\n\nPode confirmar?`;
+}
 
-  if (code < 200 || code >= 300) {
-    throw new Error("Erro OpenAI: HTTP " + code + " => " + text);
+function parseSimpleCorrection(text, pendingExtraction) {
+  const pedidos = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos : [];
+  if (!pedidos.length) return null;
+
+  const normalized = normalizeText(text);
+  const itemIndexMatch = normalized.match(/\bitem\s+(\d+)\b/);
+  const itemIndex = itemIndexMatch ? Number(itemIndexMatch[1]) : (pedidos.length === 1 ? 1 : null);
+
+  const removeMatch =
+    normalized.match(/\bremove(?:r)?\s+o\s+item\s+(\d+)\b/) ||
+    normalized.match(/\bapaga(?:r)?\s+o\s+item\s+(\d+)\b/) ||
+    normalized.match(/\bexclui(?:r)?\s+o\s+item\s+(\d+)\b/);
+
+  if (removeMatch) {
+    return {
+      is_correction: true,
+      action: "remove_item",
+      item_index: Number(removeMatch[1]),
+      fields: {},
+      motivo: "fallback regex remove item"
+    };
   }
 
-  const json = JSON.parse(text);
-  const content = json.choices && json.choices[0] && json.choices[0].message
-    ? json.choices[0].message.content
-    : "{}";
+  if (!itemIndex) return null;
 
-  return JSON.parse(content);
-}
+  const qtyMatch =
+    normalized.match(/\b(\d+(?:[.,]\d+)?)\s*(kg|g)\b/) ||
+    normalized.match(/\bnao[, ]+e\s+(\d+(?:[.,]\d+)?)\s*(kg|g)\b/);
 
-/*********************************************************
- * DATA / QUANTIDADE / PAGAMENTO
- *********************************************************/
-
-function pv1ResolverData_(dataFalada) {
-  const sOriginal = String(dataFalada || "").trim();
-  const s = pv1Norm_(sOriginal);
-
-  const tz = Session.getScriptTimeZone();
-  const hoje = new Date();
-
-  if (!s) {
-    return Utilities.formatDate(hoje, tz, "yyyy-MM-dd");
-  }
-
-  if (s === "hoje") {
-    return Utilities.formatDate(hoje, tz, "yyyy-MM-dd");
-  }
-
-  if (s === "ontem") {
-    const d = new Date(hoje);
-    d.setDate(d.getDate() - 1);
-    return Utilities.formatDate(d, tz, "yyyy-MM-dd");
-  }
-
-  if (s === "antes de ontem") {
-    const d = new Date(hoje);
-    d.setDate(d.getDate() - 2);
-    return Utilities.formatDate(d, tz, "yyyy-MM-dd");
-  }
-
-  if (s === "amanha") {
-    const d = new Date(hoje);
-    d.setDate(d.getDate() + 1);
-    return Utilities.formatDate(d, tz, "yyyy-MM-dd");
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(sOriginal)) {
-    return sOriginal;
-  }
-
-  let m = sOriginal.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) {
-    return m[3] + "-" + String(m[2]).padStart(2, "0") + "-" + String(m[1]).padStart(2, "0");
-  }
-
-  m = sOriginal.match(/^(\d{1,2})\/(\d{1,2})$/);
-  if (m) {
-    const ano = Utilities.formatDate(hoje, tz, "yyyy");
-    return ano + "-" + String(m[2]).padStart(2, "0") + "-" + String(m[1]).padStart(2, "0");
-  }
-
-  return Utilities.formatDate(hoje, tz, "yyyy-MM-dd");
-}
-
-function pv1ConverterQuantidadeParaGramas_(quantidade, unidade) {
-  const q = Number(quantidade);
-  const u = pv1Norm_(unidade || "g");
-
-  if (!isFinite(q) || q <= 0) return null;
-  if (u === "kg") return q * 1000;
-  return q;
-}
-
-function pv1ConverterGramasParaValorSheet_(quantidadeGramas) {
-  const g = Number(quantidadeGramas);
-  if (!isFinite(g) || g <= 0) return null;
-  return g / 1000;
-}
-
-function pv1ResolverFormaPagamento_(formaFalado) {
-  const s = pv1Norm_(formaFalado || "");
-  if (!s) return "PIX";
-  if (s.indexOf("pix") >= 0) return "PIX";
-  if (s.indexOf("dinheiro") >= 0) return "Dinheiro à Vista";
-  if (s.indexOf("a vista") >= 0 || s.indexOf("avista") >= 0) return "Dinheiro à Vista";
-  return "PIX";
-}
-
-function pv1ResolverVencimento_(vencimentoFalado, dataVenda) {
-  const s = String(vencimentoFalado || "").trim();
-
-  if (!s) {
-    return pv1SomarDiasDataIso_(dataVenda, 15);
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-
-  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) {
-    return m[3] + "-" + String(m[2]).padStart(2, "0") + "-" + String(m[1]).padStart(2, "0");
-  }
-
-  return pv1SomarDiasDataIso_(dataVenda, 15);
-}
-
-function pv1SomarDiasDataIso_(dataIso, dias) {
-  const d = new Date(dataIso + "T12:00:00");
-  d.setDate(d.getDate() + dias);
-  return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
-}
-
-/*********************************************************
- * HELPERS
- *********************************************************/
-
-function pv1JsonOutput_(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function pv1Norm_(s) {
-  return String(s || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function pv1Tokens_(s) {
-  return pv1Norm_(s).split(/[^a-z0-9]+/).filter(Boolean);
-}
-
-function pv1ScoreTexto_(a, b) {
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-  if (a.indexOf(b) >= 0 || b.indexOf(a) >= 0) return 0.92;
-
-  const ta = pv1Tokens_(a);
-  const tb = pv1Tokens_(b);
-  if (!ta.length || !tb.length) return 0;
-
-  const mapa = {};
-  tb.forEach(function(x) { mapa[x] = true; });
-
-  const inter = ta.filter(function(x) { return mapa[x]; }).length;
-  const uniao = Object.keys(
-    ta.concat(tb).reduce(function(acc, x) {
-      acc[x] = true;
-      return acc;
-    }, {})
-  ).length;
-
-  const jaccard = uniao ? inter / uniao : 0;
-  let score = jaccard * 0.7;
-
-  if (ta[0] && tb[0] && ta[0] === tb[0]) score += 0.15;
-  if (inter >= 2) score += 0.12;
-
-  return Math.min(0.99, score);
-}
-
-function pv1SanitizeFileName_(s) {
-  return String(s || "")
-    .replace(/[\\\/:*?"<>|#%{}~&]/g, "_")
-    .replace(/\s+/g, "_")
-    .substring(0, 180);
-}
-
-function pv1NomeMesPt_(data) {
-  const meses = [
-    "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
-    "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
-  ];
-  return meses[data.getMonth()];
-}
-
-/*********************************************************
- * TESTES
- *********************************************************/
-
-function pv1TestePreviewLocal() {
-  const body = {
-    pedidos: [
-      {
-        cliente_falado: "Diege",
-        produto_falado: "louro liga branca 65/70",
-        quantidade: 100,
-        unidade: "g",
-        data_falada: "18/04",
-        valor_falado: 5600,
-        forma_pagamento_falada: null,
-        vencimento_falado: null,
-        observacoes: "teste preview"
-      }
-    ]
-  };
-
-  Logger.log(JSON.stringify(pv1PreviewLoteV1_(body), null, 2));
-}
-
-function pv1TesteDeleteLastLocal() {
-  Logger.log(JSON.stringify(pv1DeletePreenchimentosV1_({ mode: "last" }), null, 2));
-}
-
-function pv1TestePreencherLoteLocal() {
-  const body = {
-    pedidos: [
-      {
-        cliente_falado: "Ricardo",
-        produto_falado: "loiro liga branca",
-        quantidade: 200,
-        unidade: "g",
-        data_falada: "18/04",
-        valor_falado: 5500,
-        forma_pagamento_falada: null,
-        vencimento_falado: null,
-        observacoes: "teste item 1"
+  if (qtyMatch) {
+    return {
+      is_correction: true,
+      action: "update_quantity",
+      item_index: itemIndex,
+      fields: {
+        quantidade: Number(String(qtyMatch[1]).replace(",", ".")),
+        unidade: qtyMatch[2]
       },
-      {
-        cliente_falado: "Ricardo",
-        produto_falado: "castanho liga rosa 65",
-        quantidade: 500,
-        unidade: "g",
-        data_falada: "18/04",
-        valor_falado: 3000,
-        forma_pagamento_falada: null,
-        vencimento_falado: null,
-        observacoes: "teste item 2"
-      }
-    ]
-  };
+      motivo: "fallback regex quantidade"
+    };
+  }
 
-  Logger.log(JSON.stringify(pv1PreencherLoteV1_(body), null, 2));
+  const qtyOnlyMatch = normalized.match(/\bnao[, ]+e\s+(\d+(?:[.,]\d+)?)\b/);
+  if (qtyOnlyMatch) {
+    const currentUnit = pedidos[itemIndex - 1]?.unidade || "g";
+    return {
+      is_correction: true,
+      action: "update_quantity",
+      item_index: itemIndex,
+      fields: {
+        quantidade: Number(String(qtyOnlyMatch[1]).replace(",", ".")),
+        unidade: currentUnit
+      },
+      motivo: "fallback regex quantidade sem unidade"
+    };
+  }
+
+  const clientMatch =
+    normalized.match(/\btroca\s+o\s+cliente\s+para\s+(.+)$/) ||
+    normalized.match(/\bo\s+cliente\s+e\s+(.+)$/) ||
+    normalized.match(/\bcliente\s+(.+)$/);
+
+  if (clientMatch) {
+    const cliente = String(clientMatch[1] || "").trim();
+    if (cliente) {
+      return {
+        is_correction: true,
+        action: "update_client",
+        item_index: itemIndex,
+        fields: {
+          cliente_falado: cliente
+        },
+        motivo: "fallback regex cliente"
+      };
+    }
+  }
+
+  const valueMatch =
+    normalized.match(/\bvalor\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
+    normalized.match(/\bpreco\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
+    normalized.match(/\bcusta\s+(\d+(?:[.,]\d+)?)\b/);
+
+  if (valueMatch) {
+    return {
+      is_correction: true,
+      action: "update_value",
+      item_index: itemIndex,
+      fields: {
+        valor_falado: parseBrazilianNumber(valueMatch[1])
+      },
+      motivo: "fallback regex valor"
+    };
+  }
+
+  const payment = parsePaymentText(text);
+  if (payment) {
+    return {
+      is_correction: true,
+      action: "update_payment",
+      item_index: itemIndex,
+      fields: {
+        forma_pagamento_falada: payment
+      },
+      motivo: "fallback regex pagamento"
+    };
+  }
+
+  const dueDate = normalizeDateValue(text);
+  if (
+    dueDate &&
+    dueDate !== String(text).trim() &&
+    (normalized.includes("vence") || normalized.includes("vencimento") || normalized.includes("dia"))
+  ) {
+    return {
+      is_correction: true,
+      action: "update_due_date",
+      item_index: itemIndex,
+      fields: {
+        vencimento_falado: dueDate
+      },
+      motivo: "fallback regex vencimento"
+    };
+  }
+
+  const productMatch =
+    normalized.match(/\btroca\s+o\s+produto\s+para\s+(.+)$/) ||
+    normalized.match(/\bo\s+produto\s+e\s+(.+)$/) ||
+    normalized.match(/\bproduto\s+(.+)$/);
+
+  if (productMatch) {
+    const produto = String(productMatch[1] || "").trim();
+    if (produto) {
+      return {
+        is_correction: true,
+        action: "update_product",
+        item_index: itemIndex,
+        fields: {
+          produto_falado: produto
+        },
+        motivo: "fallback regex produto"
+      };
+    }
+  }
+
+  return null;
 }
+
+function detectBatchRewriteIntent(text) {
+  const t = normalizeText(text);
+  return t.includes("comprou") || t.includes("pedido") || t.includes("pedidos");
+}
+
+async function tryBuildBatchRewriteCorrection(text, pendingExtraction) {
+  if (!detectBatchRewriteIntent(text)) return null;
+
+  const extracted = await extractOrdersFromText(text);
+  const pedidos = Array.isArray(extracted?.pedidos) ? extracted.pedidos : [];
+  if (!pedidos.length) return null;
+
+  const normalized = normalizeText(text);
+  const itemIndexMatch = normalized.match(/\bitem\s+(\d+)\b/);
+  const itemIndex = itemIndexMatch ? Number(itemIndexMatch[1]) : null;
+  const currentCount = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos.length : 0;
+
+  if (pedidos.length > 1) {
+    return {
+      is_correction: true,
+      action: "replace_batch",
+      item_index: null,
+      fields: {},
+      replacement_extraction: extracted,
+      motivo: "reescrita completa do lote"
+    };
+  }
+
+  if (pedidos.length === 1 && itemIndex) {
+    return {
+      is_correction: true,
+      action: "replace_item_fields",
+      item_index: itemIndex,
+      fields: {},
+      replacement_pedido: pedidos[0],
+      motivo: "reescrita completa do item"
+    };
+  }
+
+  if (pedidos.length === 1 && currentCount === 1) {
+    return {
+      is_correction: true,
+      action: "replace_batch",
+      item_index: null,
+      fields: {},
+      replacement_extraction: extracted,
+      motivo: "substituicao total de lote com um item"
+    };
+  }
+
+  return null;
+}
+
+async function interpretCorrectionFromText(text, pendingExtraction) {
+  const batchRewrite = await tryBuildBatchRewriteCorrection(text, pendingExtraction);
+  if (batchRewrite) return batchRewrite;
+
+  const fallback = parseSimpleCorrection(text, pendingExtraction);
+  if (fallback) return fallback;
+
+  const pedidos = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos : [];
+
+  const prompt = `
+Você é um interpretador de correções de um lote de pedidos já extraído.
+
+Você receberá:
+1. a mensagem nova do usuário
+2. o lote atual em JSON
+
+Sua tarefa:
+- descobrir se a mensagem é uma correção do lote atual
+- se for, retornar a ação estruturada
+- se não for, retornar "is_correction": false
+
+Ações permitidas:
+- alterar quantidade de um item
+- alterar cliente de um item
+- remover um item
+- alterar produto de um item
+- alterar valor de um item
+- alterar vencimento de um item
+- alterar forma de pagamento de um item
+- substituir vários campos de um item
+- substituir o lote inteiro
+
+Retorne SOMENTE JSON válido neste formato:
+
+{
+  "is_correction": true ou false,
+  "action": "update_quantity|update_client|remove_item|update_product|update_value|update_due_date|update_payment|replace_item_fields|replace_batch|null",
+  "item_index": number ou null,
+  "fields": {
+    "cliente_falado": "string ou null",
+    "produto_falado": "string ou null",
+    "quantidade": number ou null,
+    "unidade": "g|kg|un|null",
+    "valor_falado": number ou null,
+    "forma_pagamento_falada": "PIX|Dinheiro à Vista|string|null",
+    "vencimento_falado": "string ou null",
+    "data_falada": "string ou null"
+  },
+  "motivo": "string"
+}
+
+Regras:
+- item_index é baseado em 1
+- se o usuário não disser item, e houver só 1 pedido, use item_index = 1
+- se a mensagem reescrever o lote inteiro, use replace_batch
+- se a mensagem reescrever só um item, use replace_item_fields
+- se a mensagem parecer um pedido novo e não correção, retorne is_correction false
+- para data_falada e vencimento_falado, preserve o texto que conseguir
+
+Mensagem do usuário:
+${text}
+
+Lote atual:
+${JSON.stringify({ pedidos }, null, 2)}
+`.trim();
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "Você interpreta correções de lote e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0,
+      response_format: { type: "json_object" }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      }
+    }
+  );
+
+  const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
+
+  try {
+    const parsed = JSON.parse(content);
+
+    if (parsed?.fields?.data_falada) {
+      parsed.fields.data_falada = normalizeDateValue(parsed.fields.data_falada);
+    }
+
+    if (parsed?.fields?.vencimento_falado) {
+      parsed.fields.vencimento_falado = normalizeDateValue(parsed.fields.vencimento_falado);
+    }
+
+    return parsed;
+  } catch (err) {
+    return {
+      is_correction: false,
+      action: null,
+      item_index: null,
+      fields: {},
+      motivo: "Falha ao interpretar correção"
+    };
+  }
+}
+
+async function applyCorrectionToExtraction(extraction, correction) {
+  const novo = cloneExtraction(extraction);
+  const pedidos = Array.isArray(novo.pedidos) ? novo.pedidos : [];
+
+  if (correction?.action === "replace_batch") {
+    const replacement = normalizeExtraction(
+      correction?.replacement_extraction || { pedidos: [] }
+    );
+    const novosPedidos = Array.isArray(replacement?.pedidos) ? replacement.pedidos : [];
+
+    if (!novosPedidos.length) {
+      return {
+        ok: false,
+        message: "Não consegui entender o novo lote completo."
+      };
+    }
+
+    return {
+      ok: true,
+      extraction: {
+        ...novo,
+        pedidos: novosPedidos
+      },
+      message: `Substituí o lote inteiro por ${novosPedidos.length} pedido(s).`
+    };
+  }
+
+  const idx = Number(correction?.item_index || 0) - 1;
+
+  if (idx < 0 || idx >= pedidos.length) {
+    return {
+      ok: false,
+      message: "Não consegui identificar qual item corrigir."
+    };
+  }
+
+  const item = pedidos[idx];
+  const action = correction?.action;
+
+  if (action === "update_quantity") {
+    if (correction?.fields?.quantidade == null) {
+      return { ok: false, message: "Não consegui entender a nova quantidade." };
+    }
+
+    item.quantidade = Number(correction.fields.quantidade);
+    item.unidade = correction?.fields?.unidade || item.unidade || "g";
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi a quantidade do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_client") {
+    const cliente = String(correction?.fields?.cliente_falado || "").trim();
+    if (!cliente) {
+      return { ok: false, message: "Não consegui entender o novo cliente." };
+    }
+
+    item.cliente_falado = cliente;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o cliente do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_product") {
+    const produto = String(correction?.fields?.produto_falado || "").trim();
+    if (!produto) {
+      return { ok: false, message: "Não consegui entender o novo produto." };
+    }
+
+    item.produto_falado = produto;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o produto do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_value") {
+    const valor = correction?.fields?.valor_falado;
+    if (valor == null || !Number.isFinite(Number(valor))) {
+      return { ok: false, message: "Não consegui entender o novo valor." };
+    }
+
+    item.valor_falado = Number(valor);
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o valor do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_due_date") {
+    const vencimento = String(correction?.fields?.vencimento_falado || "").trim();
+    if (!vencimento) {
+      return { ok: false, message: "Não consegui entender o novo vencimento." };
+    }
+
+    item.vencimento_falado = vencimento;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o vencimento do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "update_payment") {
+    const forma = String(correction?.fields?.forma_pagamento_falada || "").trim();
+    if (!forma) {
+      return { ok: false, message: "Não consegui entender a nova forma de pagamento." };
+    }
+
+    item.forma_pagamento_falada = forma;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi a forma de pagamento do item ${idx + 1}.`
+    };
+  }
+
+  if (action === "remove_item") {
+    pedidos.splice(idx, 1);
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Removi o item ${idx + 1}.`
+    };
+  }
+
+  if (action === "replace_item_fields") {
+    const replacementPedido = correction?.replacement_pedido
+      ? normalizeSinglePedido(correction.replacement_pedido)
+      : null;
+
+    if (!replacementPedido) {
+      return {
+        ok: false,
+        message: "Não consegui entender a correção completa desse item."
+      };
+    }
+
+    pedidos[idx] = {
+      ...item,
+      ...replacementPedido,
+      cliente_falado: replacementPedido.cliente_falado || item.cliente_falado,
+      produto_falado: replacementPedido.produto_falado || item.produto_falado,
+      quantidade: replacementPedido.quantidade != null ? replacementPedido.quantidade : item.quantidade,
+      unidade: replacementPedido.unidade || item.unidade,
+      valor_falado: replacementPedido.valor_falado != null ? replacementPedido.valor_falado : item.valor_falado,
+      forma_pagamento_falada: replacementPedido.forma_pagamento_falada || item.forma_pagamento_falada,
+      vencimento_falado: replacementPedido.vencimento_falado || item.vencimento_falado,
+      data_falada: replacementPedido.data_falada || item.data_falada
+    };
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Corrigi o item ${idx + 1} com a frase completa.`
+    };
+  }
+
+  return {
+    ok: false,
+    message: "Não reconheci a ação de correção."
+  };
+}
+
+async function callGoogleAppsScript(payload) {
+  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
+    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
+  }
+
+  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
+    headers: {
+      "Content-Type": "application/json"
+    },
+    validateStatus: () => true
+  });
+
+  const contentType = resp.headers?.["content-type"] || "";
+  const bodyPreview =
+    typeof resp.data === "string"
+      ? resp.data.slice(0, 500)
+      : JSON.stringify(resp.data).slice(0, 500);
+
+  console.log("Apps Script status:", resp.status);
+  console.log("Apps Script content-type:", contentType);
+  console.log("Apps Script preview:", bodyPreview);
+
+  return resp.data;
+}
+
+function formatGoogleSuccessMessage(gsResp) {
+  const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
+  const okResults = resultados.filter((r) => r && r.ok);
+
+  if (!okResults.length) {
+    return `Lote confirmado.\n\nResposta bruta do Google:\n${JSON.stringify(gsResp).slice(0, 3500)}`;
+  }
+
+  const linhas = okResults.map((r, i) => {
+    const cliente = r.cliente_oficial || "cliente ?";
+    const produto = r.produto_oficial || "produto ?";
+    const qtdG = r.quantidade_gramas != null ? `${r.quantidade_gramas}g` : "?g";
+    const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
+    const valor = r.valor != null ? `R$ ${r.valor}` : "sem valor";
+    const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
+    const linha = r.linha_item != null ? ` | linha ${r.linha_item}` : "";
+    const forma = r.forma_pagamento || "PIX";
+    const venc = r.vencimento || "?";
+    const confianca =
+      r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
+
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco}${linha} — ${forma} — venc. ${venc}${confianca}`;
+  });
+
+  return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
+}
+
+function formatDuplicateMessage(gsResp) {
+  const dup = Array.isArray(gsResp?.resultados)
+    ? gsResp.resultados.find((r) => r && r.possible_duplicate)
+    : null;
+
+  const primeira = dup && Array.isArray(dup.duplicatas) ? dup.duplicatas[0] : null;
+
+  return [
+    "Possível duplicata encontrada.",
+    "",
+    `Cliente: ${dup?.cliente_oficial || "?"}`,
+    `Produto: ${dup?.produto_oficial || "?"}`,
+    `Quantidade: ${dup?.quantidade_gramas || "?"}g`,
+    `Data: ${dup?.data_venda || "?"}`,
+    "",
+    `Registro já existente: ${primeira ? JSON.stringify(primeira) : "não detalhado"}`,
+    "",
+    "Se quiser lançar mesmo assim, responda: confirmar duplicata"
+  ].join("\n");
+}
+
+async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pending) {
+  if (!pending || isConfirmationText(incomingText) || isCancelText(incomingText)) {
+    return false;
+  }
+
+  const correction = await interpretCorrectionFromText(incomingText, pending.extraction);
+
+  if (!correction?.is_correction) {
+    return false;
+  }
+
+  const applied = await applyCorrectionToExtraction(pending.extraction, correction);
+
+  if (!applied.ok) {
+    if (looksLikeFreshOrderMessage(incomingText)) {
+      return false;
+    }
+
+    await sendTelegramMessage(chatId, applied.message);
+    return true;
+  }
+
+  savePendingBatch(chatId, applied.extraction, {
+    ...(pending.meta || {}),
+    lastCorrectionText: incomingText,
+    lastCorrectionSource: sourceLabel,
+    duplicateAwaitingForce: false
+  });
+
+  const novoResumo = summarizeOrders(applied.extraction);
+
+  await sendTelegramMessage(
+    chatId,
+    `${sourceLabel === "audio" ? `Transcrição da correção:\n"${incomingText}"\n\n` : ""}${applied.message}\n\n${novoResumo}`
+  );
+
+  return true;
+}
+
+app.get("/", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "agente-ia-preenchimento-vendas-bot",
+    status: "online"
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    status: "healthy"
+  });
+});
+
+app.post("/telegram/webhook", async (req, res) => {
+  res.status(200).json({ ok: true });
+
+  try {
+    const update = req.body || {};
+    const msg = update.message || update.edited_message;
+    if (!msg) return;
+
+    const chatId = msg.chat?.id;
+    if (!chatId) return;
+
+    const text = (msg.text || msg.caption || "").trim();
+
+    // ===== RECEBIMENTOS: PDF / DOCUMENTO =====
+    if (msg.document) {
+      const isReceb = isRecebimentosIntent(text, msg);
+
+      if (!isReceb) {
+        await sendTelegramMessage(
+          chatId,
+          "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'processa esse extrato' ou 'pega os últimos 3 dias'."
+        );
+        return;
+      }
+
+      await handleRecebimentosMessage({
+        message: msg,
+        text,
+        sendTelegramMessage,
+        getTelegramFile,
+        downloadTelegramFileBuffer
+      });
+
+      return;
+    }
+
+    if (text && isCancelText(text)) {
+      clearPendingBatch(chatId);
+      await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
+      return;
+    }
+
+    if (text && isConfirmationText(text)) {
+      const pending = getPendingBatch(chatId);
+
+      if (!pending) {
+        await sendTelegramMessage(chatId, "Não encontrei nenhum lote pendente para confirmar.");
+        return;
+      }
+
+      const pedidos = Array.isArray(pending.extraction?.pedidos)
+        ? pending.extraction.pedidos
+        : [];
+
+      const forceDuplicateConfirmed =
+        normalizeText(text) === "confirmar duplicata" ||
+        pending?.meta?.duplicateAwaitingForce === true;
+
+      const gsResp = await callGoogleAppsScript({
+        action: "preencher_lote_v1",
+        pedidos,
+        meta: pending.meta || {},
+        force_duplicate_confirmed: forceDuplicateConfirmed
+      });
+
+      if (gsResp?.ok) {
+        clearPendingBatch(chatId);
+        await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
+      } else if (gsResp?.possible_duplicate) {
+        savePendingBatch(chatId, pending.extraction, {
+          ...(pending.meta || {}),
+          duplicateAwaitingForce: true
+        });
+
+        await sendTelegramMessage(chatId, formatDuplicateMessage(gsResp));
+      } else {
+        clearPendingBatch(chatId);
+        await sendTelegramMessage(
+          chatId,
+          `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
+        );
+      }
+
+      return;
+    }
+
+    if (text) {
+      // ===== RECEBIMENTOS: TEXTO =====
+      if (isRecebimentosIntent(text, msg)) {
+        await handleRecebimentosMessage({
+          message: msg,
+          text,
+          sendTelegramMessage,
+          getTelegramFile,
+          downloadTelegramFileBuffer
+        });
+        return;
+      }
+
+      const pending = getPendingBatch(chatId);
+
+      const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
+      if (handledCorrection) return;
+
+      const extraction = await extractOrdersFromText(text);
+      const resumo = summarizeOrders(extraction);
+
+      savePendingBatch(chatId, extraction, {
+        source: "text",
+        originalText: text,
+        duplicateAwaitingForce: false
+      });
+
+      await sendTelegramMessage(chatId, resumo);
+      return;
+    }
+
+    if (msg.voice || msg.audio) {
+      await sendTelegramMessage(chatId, "Recebi seu áudio. Vou transcrever e analisar.");
+
+      const fileId = msg.voice?.file_id || msg.audio?.file_id;
+      const fileInfo = await getTelegramFile(fileId);
+      const audioBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+      const transcription = await transcribeAudioWithOpenAI(audioBuffer, "audio.ogg");
+
+      if (!transcription || !String(transcription).trim()) {
+        await sendTelegramMessage(chatId, "Não consegui transcrever esse áudio. Se quiser, mande de novo ou envie texto.");
+        return;
+      }
+
+      // ===== RECEBIMENTOS: ÁUDIO =====
+      if (isRecebimentosIntent(transcription, msg)) {
+        await handleRecebimentosMessage({
+          message: msg,
+          text: transcription,
+          transcription,
+          sendTelegramMessage,
+          getTelegramFile,
+          downloadTelegramFileBuffer
+        });
+        return;
+      }
+
+      const pending = getPendingBatch(chatId);
+
+      const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
+      if (handledCorrection) return;
+
+      const extraction = await extractOrdersFromText(transcription);
+
+      savePendingBatch(chatId, extraction, {
+        source: "audio",
+        transcription,
+        duplicateAwaitingForce: false
+      });
+
+      const resumo = summarizeOrders(extraction);
+
+      await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"\n\n${resumo}`);
+      return;
+    }
+
+    await sendTelegramMessage(chatId, "Envie texto, áudio ou PDF para eu processar.");
+  } catch (error) {
+    console.error("Erro no webhook completo:", error);
+    console.error("Erro no webhook response data:", error.response?.data);
+    console.error("Erro no webhook message:", error.message);
+
+    try {
+      const update = req.body || {};
+      const msg = update.message || update.edited_message;
+      const chatId = msg?.chat?.id;
+
+      if (chatId) {
+        await sendTelegramMessage(chatId, "Tive um erro ao processar sua mensagem.");
+      }
+    } catch (err2) {
+      console.error("Erro ao enviar mensagem de falha:", err2.message || err2);
+    }
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor online na porta ${PORT}`);
+});
