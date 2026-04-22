@@ -94,6 +94,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "Comandos frequentes de recebimentos:",
       "preencha recebimentos de hoje",
       "preencha recebimentos dos ultimos 7 dias",
+      "preencha recebimentos dia 18/04, 19/04, 20/04",
       "associar P1 Diergia",
       "confirmar lote",
       "cancelar lote",
@@ -102,7 +103,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "Se houver código como P1, P2, I1, I2, preserve exatamente.",
       "Se houver valor monetário, preserve os números com máxima fidelidade.",
       "Nomes frequentes de clientes e pessoas:",
-      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu, Edilene, Eliete, Izabel.",
+      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu.",
       "Produtos frequentes:",
       "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
       "Medidas frequentes:",
@@ -413,14 +414,26 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
  * =========================================================
  */
 async function handleRecebimentosMessage(ctx) {
-  const { message, text, sendTelegramMessage } = ctx;
+  const { message, text, sendTelegramMessage, transcription } = ctx;
   const chatId = message.chat.id;
 
   const parsed = parseRecebimentosIntent(text, message);
 
+  if (transcription) {
+    await sendTelegramMessage(
+      chatId,
+      `Transcrição:\n"${transcription}"`
+    );
+  }
+
   await sendTelegramMessage(
     chatId,
     `Entendi. Vou processar recebimentos de ${parsed.origem.toUpperCase()} para ${parsed.periodo.label}.`
+  );
+
+  await sendTelegramMessage(
+    chatId,
+    "Montando a prévia dos recebimentos, aguarde um instante..."
   );
 
   const payload = {
@@ -1174,8 +1187,6 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(transcription, msg)) {
-        await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
-
         await handleRecebimentosMessage({
           message: msg,
           text: transcription,
