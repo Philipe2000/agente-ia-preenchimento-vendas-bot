@@ -395,8 +395,41 @@ function summarizePendingRecebimentos(lote) {
   if (pendencias.length) {
     linhas.push("", "Pendências:");
     pendencias.forEach((item) => {
+      let extra = "";
+      if (item.gc_ambiguo) {
+        extra = " | GC ambíguo";
+      } else if (item.erro) {
+        extra = ` | ${item.erro}`;
+      }
+
       linhas.push(
-        `${item.id_local}. ${item.nome_extraido} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}`
+        `${item.id_local}. ${item.nome_extraido} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}${extra}`
+      );
+    });
+  }
+
+  if (duplicados.length) {
+    linhas.push("", "Duplicados:");
+    duplicados.forEach((item, idx) => {
+      const motivo = String(item.motivo || "");
+      let origemDup = "duplicado";
+
+      if (motivo === "duplicado_gc") origemDup = "GC";
+      else if (motivo === "duplicado_drive_log") origemDup = "Drive log";
+
+      const cliente = item.cliente_oficial || item.nome_extraido || "?";
+      const data = item.data_pagamento || "?";
+      const valor = formatMoneyBRL(item.valor);
+
+      let extra = "";
+      if (item.gc_recebimento_codigo || item.gc_recebimento_id) {
+        extra =
+          " | cód " + (item.gc_recebimento_codigo || "?") +
+          " | id " + (item.gc_recebimento_id || "?");
+      }
+
+      linhas.push(
+        `${idx + 1}. ${origemDup} | ${cliente} | ${data} | ${valor}${extra}`
       );
     });
   }
