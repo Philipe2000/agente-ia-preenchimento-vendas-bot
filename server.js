@@ -96,6 +96,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "preencha recebimentos dos ultimos 7 dias",
       "preencha recebimentos dia 18/04, 19/04, 20/04",
       "associar P1 Diergia",
+      "associar Karolaine a Ricardo",
       "confirmar lote",
       "cancelar lote",
       "remover 5",
@@ -103,7 +104,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "Se houver código como P1, P2, I1, I2, preserve exatamente.",
       "Se houver valor monetário, preserve os números com máxima fidelidade.",
       "Nomes frequentes de clientes e pessoas:",
-      "Diergia, Larissa, Raquel, Ricardo, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu.",
+      "Diergia, Ricardo, Sandro, Larissa, Raquel, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu.",
       "Produtos frequentes:",
       "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
       "Medidas frequentes:",
@@ -177,31 +178,87 @@ function isCancelText(text) {
  * RECEBIMENTOS - COMANDOS DE LOTE
  * =========================================================
  */
-function parseAssociarPendenciaCommand(text) {
-  const m = String(text || "").trim().match(/^associar\s+(P\d+)\s+(.+)$/i);
-  if (!m) return null;
+function limparClienteOficialFalado(text) {
+  return String(text || "")
+    .trim()
+    .replace(/^[\s"'`.,;:!?-]+/, "")
+    .replace(/[\s"'`.,;:!?-]+$/, "")
+    .replace(/^(a|ao|aos|a\s+cliente|cliente)\s+/i, "")
+    .trim();
+}
 
-  return {
-    pendenciaId: String(m[1]).toUpperCase(),
-    clienteOficial: String(m[2]).trim()
-  };
+function parseAssociarPendenciaCommand(text, lote = null) {
+  const raw = String(text || "").trim();
+
+  // Ex.: "associar P1 Ricardo"
+  let m = raw.match(/^associar\s+(P\d+)\s+(.+)$/i);
+  if (m) {
+    return {
+      pendenciaId: String(m[1]).toUpperCase(),
+      clienteOficial: limparClienteOficialFalado(m[2])
+    };
+  }
+
+  // Ex.: "associar Karolaine a Ricardo"
+  m = raw.match(/^associar\s+(.+?)\s+(?:a|ao)\s+(.+)$/i);
+  if (m && lote) {
+    const nomeFalado = normalizeText(m[1]);
+    const clienteOficial = limparClienteOficialFalado(m[2]);
+
+    const pendencias = Array.isArray(lote?.pendencias_associacao)
+      ? lote.pendencias_associacao
+      : [];
+
+    const found = pendencias.find(p => {
+      const nomeExtraido = normalizeText(p.nome_extraido || "");
+      return nomeExtraido.includes(nomeFalado) || nomeFalado.includes(nomeExtraido);
+    });
+
+    if (found) {
+      return {
+        pendenciaId: String(found.id_local).toUpperCase(),
+        clienteOficial
+      };
+    }
+  }
+
+  return null;
 }
 
 function parseRemoverRecebimentoCommand(text) {
-  const m = String(text || "").trim().match(/^remover\s+(\d+)$/i);
-  if (!m) return null;
+  const raw = String(text || "").trim();
 
-  return {
-    itemNumero: Number(m[1])
-  };
+  let m = raw.match(/^remover\s+(\d+)[\.\!\?]?$/i);
+  if (m) {
+    return { itemNumero: Number(m[1]) };
+  }
+
+  m = raw.match(/^remove(?:r)?\s+(?:item\s+)?(\d+)[\.\!\?]?$/i);
+  if (m) {
+    return { itemNumero: Number(m[1]) };
+  }
+
+  return null;
 }
 
 function isConfirmarRecebimentosCommand(text) {
-  return /^confirmar lote$/i.test(String(text || "").trim());
+  const t = normalizeText(String(text || "").replace(/[.!?]+$/g, ""));
+  return (
+    t === "confirmar lote" ||
+    t === "confirma lote" ||
+    t === "confirmar" ||
+    t === "confirma"
+  );
 }
 
 function isCancelarRecebimentosCommand(text) {
-  return /^cancelar lote$/i.test(String(text || "").trim());
+  const t = normalizeText(String(text || "").replace(/[.!?]+$/g, ""));
+  return (
+    t === "cancelar lote" ||
+    t === "cancela lote" ||
+    t === "cancelar" ||
+    t === "cancela"
+  );
 }
 
 function formatMoneyBRL(value) {
@@ -247,12 +304,14 @@ function summarizePendingRecebimentos(lote) {
 
   linhas.push("", "Comandos:");
   linhas.push("- associar P1 NOME_DO_CLIENTE_OFICIAL");
+  linhas.push("- ou: associar NOME_DA_PENDENCIA a NOME_DO_CLIENTE_OFICIAL");
   linhas.push("- remover 5");
   linhas.push("- confirmar lote");
   linhas.push("- cancelar lote");
   linhas.push("");
-  linhas.push("Exemplo:");
+  linhas.push("Exemplos:");
   linhas.push("- associar P1 Diergia");
+  linhas.push("- associar Karolaine a Ricardo");
   linhas.push("");
   linhas.push("Você pode usar qualquer cliente oficial do MAPA_CLIENTES.");
 
@@ -263,7 +322,7 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
   const lote = getPendingRecebimentos(chatId);
   if (!lote) return false;
 
-  const associar = parseAssociarPendenciaCommand(text);
+  const associar = parseAssociarPendenciaCommand(text, lote);
   if (associar) {
     const pendencias = Array.isArray(lote.pendencias_associacao) ? lote.pendencias_associacao : [];
     const idx = pendencias.findIndex(
