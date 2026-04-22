@@ -1,8 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
-const { isRecebimentosIntent } = require("./intents_recebimentos");
-const { parseRecebimentosIntent } = require("./intents_recebimentos");
+const { isRecebimentosIntent, parseRecebimentosIntent } = require("./intents_recebimentos");
 const { callRecebimentosWebApp } = require("./appscript_recebimentos");
 
 const app = express();
@@ -106,11 +105,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "Se houver código como P1, P2, I1, I2, preserve exatamente.",
       "Se houver valor monetário, preserve os números com máxima fidelidade.",
       "Nomes frequentes de clientes e pessoas:",
-      "Diergia, Ricardo, Sandro, Larissa, Raquel, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu.",
-      "Produtos frequentes:",
-      "liga rosa, liga branca, castanho, loiro, vietnamita, castanho liga rosa, louro liga branca.",
-      "Medidas frequentes:",
-      "55cm, 60/65cm, 65/70cm, 70/75cm."
+      "Diergia, Ricardo, Sandro, Larissa, Raquel, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu."
     ].join(" ")
   );
 
@@ -146,7 +141,6 @@ function normalizeText(text) {
 
 function isConfirmationText(text) {
   const t = normalizeText(text);
-
   return (
     t === "sim" ||
     t === "ok" ||
@@ -163,7 +157,6 @@ function isConfirmationText(text) {
 
 function isCancelText(text) {
   const t = normalizeText(text);
-
   return (
     t === "cancelar" ||
     t === "cancelar lote" ||
@@ -297,6 +290,31 @@ function hasMultipleAssociations(text) {
 
 /**
  * =========================================================
+ * RECEBIMENTOS - APPS SCRIPT RESOLUTION
+ * =========================================================
+ */
+async function resolveClienteOficialViaAppsScript(nomeFalado) {
+  try {
+    const resp = await callRecebimentosWebApp({
+      action: "resolver_cliente_oficial_recebimentos",
+      origem: "inter",
+      nome_falado: nomeFalado
+    });
+
+    return resp;
+  } catch (err) {
+    console.error("Erro ao resolver cliente oficial via Apps Script:", err?.message || err);
+    return {
+      ok: false,
+      encontrado: false,
+      cliente_oficial: "",
+      message: String(err?.message || err || "Falha ao consultar Apps Script")
+    };
+  }
+}
+
+/**
+ * =========================================================
  * RECEBIMENTOS - COMANDOS DE LOTE
  * =========================================================
  */
@@ -342,14 +360,10 @@ function parseRemoverRecebimentoCommand(text) {
   const raw = String(text || "").trim();
 
   let m = raw.match(/^remover\s+(\d+)[.!?]?$/i);
-  if (m) {
-    return { itemNumero: Number(m[1]) };
-  }
+  if (m) return { itemNumero: Number(m[1]) };
 
   m = raw.match(/^remove(?:r)?\s+(?:item\s+)?(\d+)[.!?]?$/i);
-  if (m) {
-    return { itemNumero: Number(m[1]) };
-  }
+  if (m) return { itemNumero: Number(m[1]) };
 
   return null;
 }
@@ -444,6 +458,18 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
 
   const associar = parseAssociarPendenciaCommand(text, lote);
   if (associar) {
+    if (!associar.clienteOficial) {
+      await sendTelegramMessage(chatId, "Não consegui identificar o cliente oficial.");
+      return true;
+    }
+
+    // Primeiro tenta resolução via Apps Script usando a lista real do MAPA_CLIENTES
+    const resolved = await resolveClienteOficialViaAppsScript(associar.clienteOficial);
+
+    if (resolved?.ok && resolved?.encontrado && resolved?.cliente_oficial) {
+      associar.clienteOficial = resolved.cliente_oficial;
+    }
+
     const pendencias = Array.isArray(lote.pendencias_associacao)
       ? lote.pendencias_associacao
       : [];
@@ -470,6 +496,62 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
     console.log("Recebimentos associar result:", JSON.stringify(result));
 
     if (!result?.ok) {
+      // Se ainda falhou, tenta uma segunda consulta direta com o texto original sem a limpeza local
+      if (!(resolved?.ok && resolved?.encontrado)) {
+        const secondTry = await resolveClienteOficialViaAppsScript(
+          limparClienteOficialFalado(associar.clienteOficial)
+        );
+
+        if (secondTry?.ok && secondTry?.encontrado && secondTry?.cliente_oficial) {
+          payload.cliente_oficial = secondTry.cliente_oficial;
+
+          const retryResult = await callRecebimentosWebApp(payload);
+          console.log("Recebimentos associar retry result:", JSON.stringify(retryResult));
+
+          if (retryResult?.ok) {
+            associar.clienteOficial = secondTry.cliente_oficial;
+
+            const itemPronto = {
+              id_local: `I${(lote.itens_prontos?.length || 0) + 1}`,
+              cliente_oficial: associar.clienteOficial,
+              nome_extraido: pendencia.nome_extraido,
+              data_pagamento: pendencia.data_pagamento,
+              valor: pendencia.valor,
+              forma: pendencia.forma || "PIX",
+              conta_oficial: pendencia.conta_oficial || "Inter Empresas",
+              banco_extraido: pendencia.banco_extraido || "",
+              id_transacao: pendencia.id_transacao || null,
+              assunto_email: pendencia.assunto_email || "",
+              remetente: pendencia.remetente || "",
+              message_id: pendencia.message_id || "",
+              status: "pronto"
+            };
+
+            lote.pendencias_associacao.splice(idx, 1);
+            lote.itens_prontos.push(itemPronto);
+            lote.historico_comandos.push({
+              tipo: "associacao",
+              pendencia_id: associar.pendenciaId,
+              cliente_oficial: associar.clienteOficial,
+              em: new Date().toISOString()
+            });
+
+            savePendingRecebimentos(chatId, lote);
+
+            await sendTelegramMessage(
+              chatId,
+              [
+                "Associação salva:",
+                `${pendencia.nome_extraido} -> ${associar.clienteOficial}`,
+                "",
+                summarizePendingRecebimentos(lote)
+              ].join("\n")
+            );
+            return true;
+          }
+        }
+      }
+
       await sendTelegramMessage(
         chatId,
         result?.message || "Não consegui salvar a associação."
@@ -1273,7 +1355,6 @@ app.post("/telegram/webhook", async (req, res) => {
         getTelegramFile,
         downloadTelegramFileBuffer
       });
-
       return;
     }
 
@@ -1389,7 +1470,6 @@ app.post("/telegram/webhook", async (req, res) => {
       });
 
       const resumo = summarizeOrders(extraction);
-
       await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"\n\n${resumo}`);
       return;
     }
