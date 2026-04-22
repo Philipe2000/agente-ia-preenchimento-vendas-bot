@@ -1,7 +1,10 @@
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
-const { isRecebimentosIntent, parseRecebimentosIntent } = require("./intents_recebimentos");
+const {
+  isRecebimentosIntent,
+  parseRecebimentosIntent
+} = require("./intents_recebimentos");
 const { callRecebimentosWebApp } = require("./appscript_recebimentos");
 
 const app = express();
@@ -139,35 +142,6 @@ function normalizeText(text) {
     .trim();
 }
 
-function isConfirmationText(text) {
-  const t = normalizeText(text);
-  return (
-    t === "sim" ||
-    t === "ok" ||
-    t === "certo" ||
-    t === "isso" ||
-    t === "confirmar" ||
-    t === "pode confirmar" ||
-    t === "confirme" ||
-    t === "confirmar sim" ||
-    t === "confirme tudo" ||
-    t === "confirmar duplicata"
-  );
-}
-
-function isCancelText(text) {
-  const t = normalizeText(text);
-  return (
-    t === "cancelar" ||
-    t === "cancelar lote" ||
-    t === "limpar" ||
-    t === "limpar lote" ||
-    t === "comecar de novo" ||
-    t === "recomecar" ||
-    t === "apagar lote"
-  );
-}
-
 function formatMoneyBRL(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "R$ ?";
@@ -290,7 +264,7 @@ function hasMultipleAssociations(text) {
 
 /**
  * =========================================================
- * RECEBIMENTOS - APPS SCRIPT RESOLUTION
+ * RECEBIMENTOS - APPS SCRIPT HELPERS
  * =========================================================
  */
 async function resolveClienteOficialViaAppsScript(nomeFalado) {
@@ -321,7 +295,7 @@ async function resolveClienteOficialViaAppsScript(nomeFalado) {
 function parseAssociarPendenciaCommand(text, lote = null) {
   const raw = String(text || "").trim();
 
-  // Ex.: "associar P1 Ricardo"
+  // Ex.: associar P1 Ricardo
   let m = raw.match(/^associar\s+(P\d+)\s+(.+)$/i);
   if (m) {
     return {
@@ -330,7 +304,7 @@ function parseAssociarPendenciaCommand(text, lote = null) {
     };
   }
 
-  // Ex.: "associar Karolaine a Ricardo"
+  // Ex.: associar Karolaine a Ricardo
   m = raw.match(/^associar\s+(.+?)\s+(?:a|ao)\s+(.+)$/i);
   if (m && lote) {
     const nomeFalado = normalizeText(m[1]);
@@ -463,7 +437,7 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
       return true;
     }
 
-    // Primeiro tenta resolução via Apps Script usando a lista real do MAPA_CLIENTES
+    // 1) tenta resolver usando a lista real do MAPA_CLIENTES
     const resolved = await resolveClienteOficialViaAppsScript(associar.clienteOficial);
 
     if (resolved?.ok && resolved?.encontrado && resolved?.cliente_oficial) {
@@ -492,66 +466,25 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
       cliente_oficial: associar.clienteOficial
     };
 
-    const result = await callRecebimentosWebApp(payload);
+    let result = await callRecebimentosWebApp(payload);
     console.log("Recebimentos associar result:", JSON.stringify(result));
 
+    // 2) se ainda falhou, tenta resolver de novo com texto limpo
     if (!result?.ok) {
-      // Se ainda falhou, tenta uma segunda consulta direta com o texto original sem a limpeza local
-      if (!(resolved?.ok && resolved?.encontrado)) {
-        const secondTry = await resolveClienteOficialViaAppsScript(
-          limparClienteOficialFalado(associar.clienteOficial)
-        );
+      const secondTry = await resolveClienteOficialViaAppsScript(
+        limparClienteOficialFalado(associar.clienteOficial)
+      );
 
-        if (secondTry?.ok && secondTry?.encontrado && secondTry?.cliente_oficial) {
-          payload.cliente_oficial = secondTry.cliente_oficial;
+      if (secondTry?.ok && secondTry?.encontrado && secondTry?.cliente_oficial) {
+        payload.cliente_oficial = secondTry.cliente_oficial;
+        associar.clienteOficial = secondTry.cliente_oficial;
 
-          const retryResult = await callRecebimentosWebApp(payload);
-          console.log("Recebimentos associar retry result:", JSON.stringify(retryResult));
-
-          if (retryResult?.ok) {
-            associar.clienteOficial = secondTry.cliente_oficial;
-
-            const itemPronto = {
-              id_local: `I${(lote.itens_prontos?.length || 0) + 1}`,
-              cliente_oficial: associar.clienteOficial,
-              nome_extraido: pendencia.nome_extraido,
-              data_pagamento: pendencia.data_pagamento,
-              valor: pendencia.valor,
-              forma: pendencia.forma || "PIX",
-              conta_oficial: pendencia.conta_oficial || "Inter Empresas",
-              banco_extraido: pendencia.banco_extraido || "",
-              id_transacao: pendencia.id_transacao || null,
-              assunto_email: pendencia.assunto_email || "",
-              remetente: pendencia.remetente || "",
-              message_id: pendencia.message_id || "",
-              status: "pronto"
-            };
-
-            lote.pendencias_associacao.splice(idx, 1);
-            lote.itens_prontos.push(itemPronto);
-            lote.historico_comandos.push({
-              tipo: "associacao",
-              pendencia_id: associar.pendenciaId,
-              cliente_oficial: associar.clienteOficial,
-              em: new Date().toISOString()
-            });
-
-            savePendingRecebimentos(chatId, lote);
-
-            await sendTelegramMessage(
-              chatId,
-              [
-                "Associação salva:",
-                `${pendencia.nome_extraido} -> ${associar.clienteOficial}`,
-                "",
-                summarizePendingRecebimentos(lote)
-              ].join("\n")
-            );
-            return true;
-          }
-        }
+        result = await callRecebimentosWebApp(payload);
+        console.log("Recebimentos associar retry result:", JSON.stringify(result));
       }
+    }
 
+    if (!result?.ok) {
       await sendTelegramMessage(
         chatId,
         result?.message || "Não consegui salvar a associação."
@@ -1497,3 +1430,4 @@ app.post("/telegram/webhook", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor online na porta ${PORT}`);
 });
+     
