@@ -233,7 +233,7 @@ function summarizePendingRecebimentos(lote) {
   }
 
   linhas.push("", "Comandos:");
-  linhas.push("- associar P1 Diergia");
+  linhas.push("- associar P1 a CLIENTE_OFICIAL");
   linhas.push("- remover 5");
   linhas.push("- confirmar lote");
   linhas.push("- cancelar lote");
