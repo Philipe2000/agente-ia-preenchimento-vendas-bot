@@ -11,8 +11,10 @@ app.use(express.json({ limit: "20mb" }));
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
-const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
+const OPENAI_TRANSCRIBE_MODEL =
+  process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
+const GOOGLE_APPS_SCRIPT_WEBAPP_URL =
+  process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
 /**
  * =========================================================
@@ -173,20 +175,131 @@ function isCancelText(text) {
   );
 }
 
+function formatMoneyBRL(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "R$ ?";
+  return `R$ ${n.toFixed(2).replace(".", ",")}`;
+}
+
+function uniqueStrings(values) {
+  return [...new Set((values || []).filter(Boolean))];
+}
+
+function levenshtein(a, b) {
+  const s = String(a || "");
+  const t = String(b || "");
+  const m = s.length;
+  const n = t.length;
+
+  if (!m) return n;
+  if (!n) return m;
+
+  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+
+  return dp[m][n];
+}
+
+function similarityScore(a, b) {
+  const x = normalizeText(a);
+  const y = normalizeText(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (x.includes(y) || y.includes(x)) return 0.94;
+
+  const dist = levenshtein(x, y);
+  const maxLen = Math.max(x.length, y.length);
+  return maxLen ? 1 - dist / maxLen : 0;
+}
+
 /**
  * =========================================================
- * RECEBIMENTOS - COMANDOS DE LOTE
+ * RECEBIMENTOS - RESOLUÇÃO FLEXÍVEL DE CLIENTE
  * =========================================================
  */
+const CLIENTE_ALIAS_MAP = {
+  diege: "Diergia",
+  diegia: "Diergia",
+  dieergia: "Diergia",
+  diergia: "Diergia",
+  dierja: "Diergia",
+  ricardo: "Ricardo",
+  sandro: "Sandro"
+};
+
+function normalizeClienteOficialAlias(text) {
+  const raw = String(text || "").trim();
+  const t = normalizeText(raw);
+  return CLIENTE_ALIAS_MAP[t] || raw;
+}
+
 function limparClienteOficialFalado(text) {
-  return String(text || "")
+  const cleaned = String(text || "")
     .trim()
     .replace(/^[\s"'`.,;:!?-]+/, "")
     .replace(/[\s"'`.,;:!?-]+$/, "")
     .replace(/^(a|ao|aos|a\s+cliente|cliente)\s+/i, "")
     .trim();
+
+  return normalizeClienteOficialAlias(cleaned);
 }
 
+function getKnownClientesOficiaisFromLote(lote) {
+  const prontos = Array.isArray(lote?.itens_prontos) ? lote.itens_prontos : [];
+  const fromProntos = prontos.map((item) => item.cliente_oficial);
+  const fromAliases = Object.values(CLIENTE_ALIAS_MAP);
+  return uniqueStrings([...fromProntos, ...fromAliases]);
+}
+
+function resolveClienteOficialFlex(clienteFalado, lote) {
+  const raw = limparClienteOficialFalado(clienteFalado);
+  const normalized = normalizeText(raw);
+  if (!normalized) return raw;
+
+  const candidates = getKnownClientesOficiaisFromLote(lote);
+  if (!candidates.length) return raw;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const candidate of candidates) {
+    const score = similarityScore(normalized, candidate);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+
+  if (best && bestScore >= 0.82) {
+    return best;
+  }
+
+  return raw;
+}
+
+function hasMultipleAssociations(text) {
+  const matches = normalizeText(text).match(/\bassociar\b/g);
+  return Array.isArray(matches) && matches.length > 1;
+}
+
+/**
+ * =========================================================
+ * RECEBIMENTOS - COMANDOS DE LOTE
+ * =========================================================
+ */
 function parseAssociarPendenciaCommand(text, lote = null) {
   const raw = String(text || "").trim();
 
@@ -195,7 +308,7 @@ function parseAssociarPendenciaCommand(text, lote = null) {
   if (m) {
     return {
       pendenciaId: String(m[1]).toUpperCase(),
-      clienteOficial: limparClienteOficialFalado(m[2])
+      clienteOficial: resolveClienteOficialFlex(m[2], lote)
     };
   }
 
@@ -203,13 +316,13 @@ function parseAssociarPendenciaCommand(text, lote = null) {
   m = raw.match(/^associar\s+(.+?)\s+(?:a|ao)\s+(.+)$/i);
   if (m && lote) {
     const nomeFalado = normalizeText(m[1]);
-    const clienteOficial = limparClienteOficialFalado(m[2]);
+    const clienteOficial = resolveClienteOficialFlex(m[2], lote);
 
     const pendencias = Array.isArray(lote?.pendencias_associacao)
       ? lote.pendencias_associacao
       : [];
 
-    const found = pendencias.find(p => {
+    const found = pendencias.find((p) => {
       const nomeExtraido = normalizeText(p.nome_extraido || "");
       return nomeExtraido.includes(nomeFalado) || nomeFalado.includes(nomeExtraido);
     });
@@ -228,12 +341,12 @@ function parseAssociarPendenciaCommand(text, lote = null) {
 function parseRemoverRecebimentoCommand(text) {
   const raw = String(text || "").trim();
 
-  let m = raw.match(/^remover\s+(\d+)[\.\!\?]?$/i);
+  let m = raw.match(/^remover\s+(\d+)[.!?]?$/i);
   if (m) {
     return { itemNumero: Number(m[1]) };
   }
 
-  m = raw.match(/^remove(?:r)?\s+(?:item\s+)?(\d+)[\.\!\?]?$/i);
+  m = raw.match(/^remove(?:r)?\s+(?:item\s+)?(\d+)[.!?]?$/i);
   if (m) {
     return { itemNumero: Number(m[1]) };
   }
@@ -261,18 +374,16 @@ function isCancelarRecebimentosCommand(text) {
   );
 }
 
-function formatMoneyBRL(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "R$ ?";
-  return `R$ ${n.toFixed(2).replace(".", ",")}`;
-}
-
 function summarizePendingRecebimentos(lote) {
   const prontos = Array.isArray(lote?.itens_prontos) ? lote.itens_prontos : [];
-  const pendencias = Array.isArray(lote?.pendencias_associacao) ? lote.pendencias_associacao : [];
+  const pendencias = Array.isArray(lote?.pendencias_associacao)
+    ? lote.pendencias_associacao
+    : [];
   const ignorados = Array.isArray(lote?.ignorados) ? lote.ignorados : [];
   const duplicados = Array.isArray(lote?.duplicados) ? lote.duplicados : [];
-  const jaProcessados = Array.isArray(lote?.ja_processados) ? lote.ja_processados : [];
+  const jaProcessados = Array.isArray(lote?.ja_processados)
+    ? lote.ja_processados
+    : [];
 
   const linhas = [];
   linhas.push(`Recebimentos ${String(lote?.origem || "").toUpperCase()} encontrados.`);
@@ -295,9 +406,9 @@ function summarizePendingRecebimentos(lote) {
 
   if (pendencias.length) {
     linhas.push("", "Pendências:");
-    pendencias.forEach((item, idx) => {
+    pendencias.forEach((item) => {
       linhas.push(
-        `P${idx + 1}. ${item.nome_extraido} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}`
+        `${item.id_local}. ${item.nome_extraido} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}`
       );
     });
   }
@@ -313,6 +424,7 @@ function summarizePendingRecebimentos(lote) {
   linhas.push("- associar P1 Diergia");
   linhas.push("- associar Karolaine a Ricardo");
   linhas.push("");
+  linhas.push("Faça uma associação por vez.");
   linhas.push("Você pode usar qualquer cliente oficial do MAPA_CLIENTES.");
 
   return linhas.join("\n");
@@ -322,11 +434,21 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
   const lote = getPendingRecebimentos(chatId);
   if (!lote) return false;
 
+  if (hasMultipleAssociations(text)) {
+    await sendTelegramMessage(
+      chatId,
+      "Faça uma associação por vez. Exemplo: associar Karolaine a Ricardo"
+    );
+    return true;
+  }
+
   const associar = parseAssociarPendenciaCommand(text, lote);
   if (associar) {
-    const pendencias = Array.isArray(lote.pendencias_associacao) ? lote.pendencias_associacao : [];
+    const pendencias = Array.isArray(lote.pendencias_associacao)
+      ? lote.pendencias_associacao
+      : [];
     const idx = pendencias.findIndex(
-      p => String(p.id_local || "").toUpperCase() === associar.pendenciaId
+      (p) => String(p.id_local || "").toUpperCase() === associar.pendenciaId
     );
 
     if (idx < 0) {
@@ -479,10 +601,7 @@ async function handleRecebimentosMessage(ctx) {
   const parsed = parseRecebimentosIntent(text, message);
 
   if (transcription) {
-    await sendTelegramMessage(
-      chatId,
-      `Transcrição:\n"${transcription}"`
-    );
+    await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
   }
 
   await sendTelegramMessage(
