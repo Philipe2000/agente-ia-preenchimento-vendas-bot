@@ -2,7 +2,8 @@ const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
 const { isRecebimentosIntent } = require("./intents_recebimentos");
-const { handleRecebimentosMessage } = require("./recebimentos");
+const { parseRecebimentosIntent } = require("./intents_recebimentos");
+const { callRecebimentosWebApp } = require("./appscript_recebimentos");
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -12,8 +13,31 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const GOOGLE_APPS_SCRIPT_WEBAPP_URL = process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
-const pendingBatches = new Map();
+/**
+ * =========================================================
+ * ESTADO EM MEMÓRIA
+ * =========================================================
+ */
+const pendingBatches = new Map(); // vendas
+const pendingRecebimentos = new Map(); // recebimentos
 
+function savePendingRecebimentos(chatId, lote) {
+  pendingRecebimentos.set(String(chatId), lote);
+}
+
+function getPendingRecebimentos(chatId) {
+  return pendingRecebimentos.get(String(chatId)) || null;
+}
+
+function clearPendingRecebimentos(chatId) {
+  pendingRecebimentos.delete(String(chatId));
+}
+
+/**
+ * =========================================================
+ * TELEGRAM
+ * =========================================================
+ */
 function telegramApiUrl(method) {
   return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 }
@@ -49,17 +73,17 @@ async function downloadTelegramFileBuffer(filePath) {
   return Buffer.from(resp.data);
 }
 
+/**
+ * =========================================================
+ * OPENAI - TRANSCRIÇÃO
+ * =========================================================
+ */
 async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   const form = new FormData();
   form.append("file", buffer, filename);
-
-  // Modelo mais forte de transcrição
   form.append("model", "gpt-4o-transcribe");
-
-  // Idioma esperado
   form.append("language", "pt");
 
-  // Vocabulário útil do seu negócio
   form.append(
     "prompt",
     [
@@ -90,6 +114,11 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   return resp.data?.text || "";
 }
 
+/**
+ * =========================================================
+ * UTIL GERAIS
+ * =========================================================
+ */
 function normalizeText(text) {
   return String(text || "")
     .normalize("NFD")
@@ -130,6 +159,302 @@ function isCancelText(text) {
   );
 }
 
+/**
+ * =========================================================
+ * RECEBIMENTOS - COMANDOS DE LOTE
+ * =========================================================
+ */
+function parseAssociarPendenciaCommand(text) {
+  const m = String(text || "").trim().match(/^associar\s+(P\d+)\s+(.+)$/i);
+  if (!m) return null;
+
+  return {
+    pendenciaId: String(m[1]).toUpperCase(),
+    clienteOficial: String(m[2]).trim()
+  };
+}
+
+function parseRemoverRecebimentoCommand(text) {
+  const m = String(text || "").trim().match(/^remover\s+(\d+)$/i);
+  if (!m) return null;
+
+  return {
+    itemNumero: Number(m[1])
+  };
+}
+
+function isConfirmarRecebimentosCommand(text) {
+  return /^confirmar lote$/i.test(String(text || "").trim());
+}
+
+function isCancelarRecebimentosCommand(text) {
+  return /^cancelar lote$/i.test(String(text || "").trim());
+}
+
+function formatMoneyBRL(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "R$ ?";
+  return `R$ ${n.toFixed(2).replace(".", ",")}`;
+}
+
+function summarizePendingRecebimentos(lote) {
+  const prontos = Array.isArray(lote?.itens_prontos) ? lote.itens_prontos : [];
+  const pendencias = Array.isArray(lote?.pendencias_associacao) ? lote.pendencias_associacao : [];
+  const ignorados = Array.isArray(lote?.ignorados) ? lote.ignorados : [];
+  const duplicados = Array.isArray(lote?.duplicados) ? lote.duplicados : [];
+  const jaProcessados = Array.isArray(lote?.ja_processados) ? lote.ja_processados : [];
+
+  const linhas = [];
+  linhas.push(`Recebimentos ${String(lote?.origem || "").toUpperCase()} encontrados.`);
+  linhas.push("");
+  linhas.push(`Período: ${lote?.periodo?.label || "não informado"}`);
+  linhas.push(`Prontos para preencher: ${prontos.length}`);
+  linhas.push(`Pendências: ${pendencias.length}`);
+  linhas.push(`Ignorados: ${ignorados.length}`);
+  linhas.push(`Já processados: ${jaProcessados.length}`);
+  linhas.push(`Duplicados: ${duplicados.length}`);
+
+  if (prontos.length) {
+    linhas.push("", "Prontos:");
+    prontos.forEach((item, idx) => {
+      linhas.push(
+        `${idx + 1}. ${item.cliente_oficial} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}`
+      );
+    });
+  }
+
+  if (pendencias.length) {
+    linhas.push("", "Pendências:");
+    pendencias.forEach((item, idx) => {
+      linhas.push(
+        `P${idx + 1}. ${item.nome_extraido} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}`
+      );
+    });
+  }
+
+  linhas.push("", "Comandos:");
+  linhas.push("- associar P1 Diergia");
+  linhas.push("- remover 5");
+  linhas.push("- confirmar lote");
+  linhas.push("- cancelar lote");
+
+  return linhas.join("\n");
+}
+
+async function tryHandleRecebimentosPendingCommands(chatId, text) {
+  const lote = getPendingRecebimentos(chatId);
+  if (!lote) return false;
+
+  const associar = parseAssociarPendenciaCommand(text);
+  if (associar) {
+    const pendencias = Array.isArray(lote.pendencias_associacao) ? lote.pendencias_associacao : [];
+    const idx = pendencias.findIndex(p => String(p.id_local).toUpperCase() === associar.pendenciaId);
+
+    if (idx < 0) {
+      await sendTelegramMessage(chatId, `Não encontrei a pendência ${associar.pendenciaId}.`);
+      return true;
+    }
+
+    const pendencia = pendencias[idx];
+
+    const payload = {
+      action: "associar_pendencia_recebimentos",
+      origem: lote.origem,
+      pendencia_id: pendencia.id_local,
+      nome_extraido: pendencia.nome_extraido,
+      cliente_oficial: associar.clienteOficial
+    };
+
+    const result = await callRecebimentosWebApp(payload);
+    console.log("Recebimentos associar result:", JSON.stringify(result));
+
+    if (!result?.ok) {
+      await sendTelegramMessage(
+        chatId,
+        result?.message || "Não consegui salvar a associação."
+      );
+      return true;
+    }
+
+    const itemPronto = {
+      id_local: `I${(lote.itens_prontos?.length || 0) + 1}`,
+      cliente_oficial: associar.clienteOficial,
+      nome_extraido: pendencia.nome_extraido,
+      data_pagamento: pendencia.data_pagamento,
+      valor: pendencia.valor,
+      forma: pendencia.forma || "PIX",
+      conta_oficial: pendencia.conta_oficial || "Inter Empresas",
+      banco_extraido: pendencia.banco_extraido || "",
+      id_transacao: pendencia.id_transacao || null,
+      assunto_email: pendencia.assunto_email || "",
+      remetente: pendencia.remetente || "",
+      status: "pronto"
+    };
+
+    lote.pendencias_associacao.splice(idx, 1);
+    lote.itens_prontos.push(itemPronto);
+    lote.historico_comandos.push({
+      tipo: "associacao",
+      pendencia_id: associar.pendenciaId,
+      cliente_oficial: associar.clienteOficial,
+      em: new Date().toISOString()
+    });
+
+    savePendingRecebimentos(chatId, lote);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        `Associação salva:`,
+        `${pendencia.nome_extraido} -> ${associar.clienteOficial}`,
+        "",
+        summarizePendingRecebimentos(lote)
+      ].join("\n")
+    );
+    return true;
+  }
+
+  const remover = parseRemoverRecebimentoCommand(text);
+  if (remover) {
+    const idx = remover.itemNumero - 1;
+    const prontos = Array.isArray(lote.itens_prontos) ? lote.itens_prontos : [];
+
+    if (idx < 0 || idx >= prontos.length) {
+      await sendTelegramMessage(chatId, `Não encontrei o item ${remover.itemNumero}.`);
+      return true;
+    }
+
+    const removido = prontos.splice(idx, 1)[0];
+
+    lote.historico_comandos.push({
+      tipo: "remocao",
+      item_numero: remover.itemNumero,
+      cliente_oficial: removido?.cliente_oficial || "",
+      em: new Date().toISOString()
+    });
+
+    savePendingRecebimentos(chatId, lote);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        `Item removido do lote:`,
+        `${remover.itemNumero}. ${removido.cliente_oficial} | ${removido.data_pagamento} | ${formatMoneyBRL(removido.valor)}`,
+        "",
+        summarizePendingRecebimentos(lote)
+      ].join("\n")
+    );
+    return true;
+  }
+
+  if (isCancelarRecebimentosCommand(text)) {
+    clearPendingRecebimentos(chatId);
+    await sendTelegramMessage(chatId, "Lote de recebimentos cancelado.");
+    return true;
+  }
+
+  if (isConfirmarRecebimentosCommand(text)) {
+    if ((lote.pendencias_associacao || []).length > 0) {
+      await sendTelegramMessage(
+        chatId,
+        "Ainda existem pendências de associação. Resolva antes de confirmar o lote."
+      );
+      return true;
+    }
+
+    const payload = {
+      action: "confirmar_lote_recebimentos",
+      origem: lote.origem,
+      itens: lote.itens_prontos || []
+    };
+
+    const result = await callRecebimentosWebApp(payload);
+    console.log("Recebimentos confirmar result:", JSON.stringify(result));
+
+    if (!result?.ok) {
+      await sendTelegramMessage(
+        chatId,
+        result?.message || "Não consegui confirmar o lote de recebimentos."
+      );
+      return true;
+    }
+
+    clearPendingRecebimentos(chatId);
+    await sendTelegramMessage(chatId, result?.message || "Lote confirmado com sucesso.");
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * =========================================================
+ * RECEBIMENTOS - HANDLER PRINCIPAL
+ * =========================================================
+ */
+async function handleRecebimentosMessage(ctx) {
+  const { message, text, sendTelegramMessage } = ctx;
+  const chatId = message.chat.id;
+
+  const parsed = parseRecebimentosIntent(text, message);
+
+  await sendTelegramMessage(
+    chatId,
+    `Entendi. Vou processar recebimentos de ${parsed.origem.toUpperCase()} para ${parsed.periodo.label}.`
+  );
+
+  const payload = {
+    action: "processar_recebimentos_v1",
+    origem: parsed.origem,
+    periodo: parsed.periodo,
+    telegram: {
+      chat_id: chatId,
+      has_document: !!message.document
+    },
+    message_meta: {
+      message_id: message.message_id || null,
+      date: message.date || null
+    }
+  };
+
+  const result = await callRecebimentosWebApp(payload);
+  console.log("Recebimentos result:", JSON.stringify(result));
+
+  if (result?.modo === "pre_visualizacao") {
+    const lote = {
+      tipo: "recebimentos_lote_pendente",
+      origem: result.origem || parsed.origem,
+      periodo: result.periodo || parsed.periodo,
+      criadoEm: new Date().toISOString(),
+      resumoOrigem: {
+        processados_detectados: (result.itens_prontos || []).length,
+        ignorados: (result.ignorados || []).length,
+        duplicados: (result.duplicados || []).length,
+        ja_processados: (result.ja_processados || []).length,
+        erros: (result.pendencias_associacao || []).length
+      },
+      itens_prontos: result.itens_prontos || [],
+      pendencias_associacao: result.pendencias_associacao || [],
+      ignorados: result.ignorados || [],
+      duplicados: result.duplicados || [],
+      ja_processados: result.ja_processados || [],
+      historico_comandos: []
+    };
+
+    savePendingRecebimentos(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingRecebimentos(lote));
+    return;
+  }
+
+  const resumo = result?.message || "Recebimentos processados.";
+  await sendTelegramMessage(chatId, resumo);
+}
+
+/**
+ * =========================================================
+ * VENDAS - CÓDIGO ATUAL
+ * =========================================================
+ */
 function looksLikeFreshOrderMessage(text) {
   const t = normalizeText(text);
 
@@ -203,9 +528,7 @@ function normalizeDateValue(rawText) {
   }
 
   let m = original.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (m) {
-    return `${m[1]}-${m[2]}-${m[3]}`;
-  }
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
 
   m = original.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (m) {
@@ -237,13 +560,8 @@ function normalizeSinglePedido(pedido) {
     out.valor_falado = Number(out.valor_falado);
   }
 
-  if (out.data_falada) {
-    out.data_falada = normalizeDateValue(out.data_falada);
-  }
-
-  if (out.vencimento_falado) {
-    out.vencimento_falado = normalizeDateValue(out.vencimento_falado);
-  }
+  if (out.data_falada) out.data_falada = normalizeDateValue(out.data_falada);
+  if (out.vencimento_falado) out.vencimento_falado = normalizeDateValue(out.vencimento_falado);
 
   return out;
 }
@@ -258,11 +576,9 @@ function normalizeExtraction(extraction) {
 
 function parsePaymentText(rawText) {
   const t = normalizeText(rawText);
-
   if (t.includes("pix")) return "PIX";
   if (t.includes("dinheiro")) return "Dinheiro à Vista";
   if (t.includes("a vista") || t.includes("avista")) return "Dinheiro à Vista";
-
   return null;
 }
 
@@ -283,30 +599,19 @@ function inferGlobalContextFromText(text) {
   }
 
   const explicitDates = [];
-
   const reFull = /\b(\d{1,2}\/\d{1,2}\/\d{4})\b/g;
   let m;
-  while ((m = reFull.exec(original)) !== null) {
-    explicitDates.push(normalizeDateValue(m[1]));
-  }
+  while ((m = reFull.exec(original)) !== null) explicitDates.push(normalizeDateValue(m[1]));
 
   const reShort = /\b(\d{1,2}\/\d{1,2})\b/g;
-  while ((m = reShort.exec(original)) !== null) {
-    explicitDates.push(normalizeDateValue(m[1]));
-  }
+  while ((m = reShort.exec(original)) !== null) explicitDates.push(normalizeDateValue(m[1]));
 
-  if (normalized.includes("antes de ontem")) {
-    explicitDates.push(normalizeDateValue("antes de ontem"));
-  } else if (normalized.includes("ontem")) {
-    explicitDates.push(normalizeDateValue("ontem"));
-  } else if (normalized.includes("hoje")) {
-    explicitDates.push(normalizeDateValue("hoje"));
-  }
+  if (normalized.includes("antes de ontem")) explicitDates.push(normalizeDateValue("antes de ontem"));
+  else if (normalized.includes("ontem")) explicitDates.push(normalizeDateValue("ontem"));
+  else if (normalized.includes("hoje")) explicitDates.push(normalizeDateValue("hoje"));
 
   const uniqueDates = [...new Set(explicitDates.filter(Boolean))];
-  if (uniqueDates.length === 1) {
-    context.data_falada = uniqueDates[0];
-  }
+  if (uniqueDates.length === 1) context.data_falada = uniqueDates[0];
 
   const duePatterns = [
     /\bvence(?:\s+no)?\s+dia\s+(\d{1,2}\/\d{1,2}(?:\/\d{4})?)\b/i,
@@ -322,9 +627,7 @@ function inferGlobalContextFromText(text) {
     }
   }
 
-  const clientePattern =
-    original.match(/^\s*([A-Za-zÀ-ÿ'’\-]+)\s+comprou\b/i);
-
+  const clientePattern = original.match(/^\s*([A-Za-zÀ-ÿ'’\-]+)\s+comprou\b/i);
   if (clientePattern) {
     context.cliente_falado = String(clientePattern[1] || "").trim() || null;
   }
@@ -334,10 +637,7 @@ function inferGlobalContextFromText(text) {
 
 function applyBatchContextDefaults(extraction, rawText) {
   const normalizedExtraction = normalizeExtraction(extraction);
-  const pedidos = Array.isArray(normalizedExtraction?.pedidos)
-    ? normalizedExtraction.pedidos
-    : [];
-
+  const pedidos = Array.isArray(normalizedExtraction?.pedidos) ? normalizedExtraction.pedidos : [];
   if (!pedidos.length) return normalizedExtraction;
 
   const globalContext = inferGlobalContextFromText(rawText);
@@ -345,21 +645,10 @@ function applyBatchContextDefaults(extraction, rawText) {
   const filled = pedidos.map((pedido) => {
     const out = { ...pedido };
 
-    if (!out.cliente_falado && globalContext.cliente_falado) {
-      out.cliente_falado = globalContext.cliente_falado;
-    }
-
-    if (!out.data_falada && globalContext.data_falada) {
-      out.data_falada = globalContext.data_falada;
-    }
-
-    if (!out.vencimento_falado && globalContext.vencimento_falado) {
-      out.vencimento_falado = globalContext.vencimento_falado;
-    }
-
-    if (!out.forma_pagamento_falada && globalContext.forma_pagamento_falada) {
-      out.forma_pagamento_falada = globalContext.forma_pagamento_falada;
-    }
+    if (!out.cliente_falado && globalContext.cliente_falado) out.cliente_falado = globalContext.cliente_falado;
+    if (!out.data_falada && globalContext.data_falada) out.data_falada = globalContext.data_falada;
+    if (!out.vencimento_falado && globalContext.vencimento_falado) out.vencimento_falado = globalContext.vencimento_falado;
+    if (!out.forma_pagamento_falada && globalContext.forma_pagamento_falada) out.forma_pagamento_falada = globalContext.forma_pagamento_falada;
 
     return normalizeSinglePedido(out);
   });
@@ -383,16 +672,13 @@ Regras:
 - Se a quantidade vier em kg, preserve unidade = "kg".
 - Se a quantidade vier em g/gramas, preserve unidade = "g".
 - Se o usuário disser um valor por extenso, converta para número.
-  Exemplo: "dois mil duzentos e cinquenta" => 2250
 - Se o usuário disser data da compra como "18/04", preserve "18/04".
 - Se o usuário disser "ontem", "antes de ontem" ou "hoje", preserve esse texto em data_falada.
 - Se a forma de pagamento não for dita, retorne null.
 - Se o vencimento não for dito, retorne null.
-- Se um mesmo contexto geral de data, cliente, vencimento ou pagamento parecer valer para vários pedidos, ainda assim extraia pedido por pedido e preserve o máximo possível.
 - Retorne SOMENTE JSON válido.
 
 Formato exato:
-
 {
   "pedidos": [
     {
@@ -439,7 +725,6 @@ ${text}
   );
 
   const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
-  console.log("Resposta bruta da OpenAI extractOrdersFromText:", content);
 
   try {
     const parsed = JSON.parse(content);
@@ -452,9 +737,7 @@ ${text}
 function summarizeOrders(extraction) {
   const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
 
-  if (!pedidos.length) {
-    return "Não consegui extrair pedidos com segurança ainda.";
-  }
+  if (!pedidos.length) return "Não consegui extrair pedidos com segurança ainda.";
 
   const linhas = pedidos.map((p, i) => {
     const qtd = p.quantidade != null ? String(p.quantidade) : "?";
@@ -514,21 +797,6 @@ function parseSimpleCorrection(text, pendingExtraction) {
     };
   }
 
-  const qtyOnlyMatch = normalized.match(/\bnao[, ]+e\s+(\d+(?:[.,]\d+)?)\b/);
-  if (qtyOnlyMatch) {
-    const currentUnit = pedidos[itemIndex - 1]?.unidade || "g";
-    return {
-      is_correction: true,
-      action: "update_quantity",
-      item_index: itemIndex,
-      fields: {
-        quantidade: Number(String(qtyOnlyMatch[1]).replace(",", ".")),
-        unidade: currentUnit
-      },
-      motivo: "fallback regex quantidade sem unidade"
-    };
-  }
-
   const clientMatch =
     normalized.match(/\btroca\s+o\s+cliente\s+para\s+(.+)$/) ||
     normalized.match(/\bo\s+cliente\s+e\s+(.+)$/) ||
@@ -545,73 +813,6 @@ function parseSimpleCorrection(text, pendingExtraction) {
           cliente_falado: cliente
         },
         motivo: "fallback regex cliente"
-      };
-    }
-  }
-
-  const valueMatch =
-    normalized.match(/\bvalor\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
-    normalized.match(/\bpreco\s+(?:e|é)?\s*(\d+(?:[.,]\d+)?)\b/) ||
-    normalized.match(/\bcusta\s+(\d+(?:[.,]\d+)?)\b/);
-
-  if (valueMatch) {
-    return {
-      is_correction: true,
-      action: "update_value",
-      item_index: itemIndex,
-      fields: {
-        valor_falado: parseBrazilianNumber(valueMatch[1])
-      },
-      motivo: "fallback regex valor"
-    };
-  }
-
-  const payment = parsePaymentText(text);
-  if (payment) {
-    return {
-      is_correction: true,
-      action: "update_payment",
-      item_index: itemIndex,
-      fields: {
-        forma_pagamento_falada: payment
-      },
-      motivo: "fallback regex pagamento"
-    };
-  }
-
-  const dueDate = normalizeDateValue(text);
-  if (
-    dueDate &&
-    dueDate !== String(text).trim() &&
-    (normalized.includes("vence") || normalized.includes("vencimento") || normalized.includes("dia"))
-  ) {
-    return {
-      is_correction: true,
-      action: "update_due_date",
-      item_index: itemIndex,
-      fields: {
-        vencimento_falado: dueDate
-      },
-      motivo: "fallback regex vencimento"
-    };
-  }
-
-  const productMatch =
-    normalized.match(/\btroca\s+o\s+produto\s+para\s+(.+)$/) ||
-    normalized.match(/\bo\s+produto\s+e\s+(.+)$/) ||
-    normalized.match(/\bproduto\s+(.+)$/);
-
-  if (productMatch) {
-    const produto = String(productMatch[1] || "").trim();
-    if (produto) {
-      return {
-        is_correction: true,
-        action: "update_product",
-        item_index: itemIndex,
-        fields: {
-          produto_falado: produto
-        },
-        motivo: "fallback regex produto"
       };
     }
   }
@@ -679,113 +880,13 @@ async function interpretCorrectionFromText(text, pendingExtraction) {
   const fallback = parseSimpleCorrection(text, pendingExtraction);
   if (fallback) return fallback;
 
-  const pedidos = Array.isArray(pendingExtraction?.pedidos) ? pendingExtraction.pedidos : [];
-
-  const prompt = `
-Você é um interpretador de correções de um lote de pedidos já extraído.
-
-Você receberá:
-1. a mensagem nova do usuário
-2. o lote atual em JSON
-
-Sua tarefa:
-- descobrir se a mensagem é uma correção do lote atual
-- se for, retornar a ação estruturada
-- se não for, retornar "is_correction": false
-
-Ações permitidas:
-- alterar quantidade de um item
-- alterar cliente de um item
-- remover um item
-- alterar produto de um item
-- alterar valor de um item
-- alterar vencimento de um item
-- alterar forma de pagamento de um item
-- substituir vários campos de um item
-- substituir o lote inteiro
-
-Retorne SOMENTE JSON válido neste formato:
-
-{
-  "is_correction": true ou false,
-  "action": "update_quantity|update_client|remove_item|update_product|update_value|update_due_date|update_payment|replace_item_fields|replace_batch|null",
-  "item_index": number ou null,
-  "fields": {
-    "cliente_falado": "string ou null",
-    "produto_falado": "string ou null",
-    "quantidade": number ou null,
-    "unidade": "g|kg|un|null",
-    "valor_falado": number ou null,
-    "forma_pagamento_falada": "PIX|Dinheiro à Vista|string|null",
-    "vencimento_falado": "string ou null",
-    "data_falada": "string ou null"
-  },
-  "motivo": "string"
-}
-
-Regras:
-- item_index é baseado em 1
-- se o usuário não disser item, e houver só 1 pedido, use item_index = 1
-- se a mensagem reescrever o lote inteiro, use replace_batch
-- se a mensagem reescrever só um item, use replace_item_fields
-- se a mensagem parecer um pedido novo e não correção, retorne is_correction false
-- para data_falada e vencimento_falado, preserve o texto que conseguir
-
-Mensagem do usuário:
-${text}
-
-Lote atual:
-${JSON.stringify({ pedidos }, null, 2)}
-`.trim();
-
-  const resp = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4.1-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Você interpreta correções de lote e responde apenas JSON válido, sem markdown, sem comentários e sem texto extra."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      temperature: 0,
-      response_format: { type: "json_object" }
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
-    }
-  );
-
-  const content = String(resp.data?.choices?.[0]?.message?.content || "{}").trim();
-
-  try {
-    const parsed = JSON.parse(content);
-
-    if (parsed?.fields?.data_falada) {
-      parsed.fields.data_falada = normalizeDateValue(parsed.fields.data_falada);
-    }
-
-    if (parsed?.fields?.vencimento_falado) {
-      parsed.fields.vencimento_falado = normalizeDateValue(parsed.fields.vencimento_falado);
-    }
-
-    return parsed;
-  } catch (err) {
-    return {
-      is_correction: false,
-      action: null,
-      item_index: null,
-      fields: {},
-      motivo: "Falha ao interpretar correção"
-    };
-  }
+  return {
+    is_correction: false,
+    action: null,
+    item_index: null,
+    fields: {},
+    motivo: "não interpretado"
+  };
 }
 
 async function applyCorrectionToExtraction(extraction, correction) {
@@ -793,9 +894,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
   const pedidos = Array.isArray(novo.pedidos) ? novo.pedidos : [];
 
   if (correction?.action === "replace_batch") {
-    const replacement = normalizeExtraction(
-      correction?.replacement_extraction || { pedidos: [] }
-    );
+    const replacement = normalizeExtraction(correction?.replacement_extraction || { pedidos: [] });
     const novosPedidos = Array.isArray(replacement?.pedidos) ? replacement.pedidos : [];
 
     if (!novosPedidos.length) {
@@ -816,7 +915,6 @@ async function applyCorrectionToExtraction(extraction, correction) {
   }
 
   const idx = Number(correction?.item_index || 0) - 1;
-
   if (idx < 0 || idx >= pedidos.length) {
     return {
       ok: false,
@@ -828,135 +926,19 @@ async function applyCorrectionToExtraction(extraction, correction) {
   const action = correction?.action;
 
   if (action === "update_quantity") {
-    if (correction?.fields?.quantidade == null) {
-      return { ok: false, message: "Não consegui entender a nova quantidade." };
-    }
-
     item.quantidade = Number(correction.fields.quantidade);
     item.unidade = correction?.fields?.unidade || item.unidade || "g";
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi a quantidade do item ${idx + 1}.`
-    };
+    return { ok: true, extraction: novo, message: `Corrigi a quantidade do item ${idx + 1}.` };
   }
 
   if (action === "update_client") {
-    const cliente = String(correction?.fields?.cliente_falado || "").trim();
-    if (!cliente) {
-      return { ok: false, message: "Não consegui entender o novo cliente." };
-    }
-
-    item.cliente_falado = cliente;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o cliente do item ${idx + 1}.`
-    };
-  }
-
-  if (action === "update_product") {
-    const produto = String(correction?.fields?.produto_falado || "").trim();
-    if (!produto) {
-      return { ok: false, message: "Não consegui entender o novo produto." };
-    }
-
-    item.produto_falado = produto;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o produto do item ${idx + 1}.`
-    };
-  }
-
-  if (action === "update_value") {
-    const valor = correction?.fields?.valor_falado;
-    if (valor == null || !Number.isFinite(Number(valor))) {
-      return { ok: false, message: "Não consegui entender o novo valor." };
-    }
-
-    item.valor_falado = Number(valor);
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o valor do item ${idx + 1}.`
-    };
-  }
-
-  if (action === "update_due_date") {
-    const vencimento = String(correction?.fields?.vencimento_falado || "").trim();
-    if (!vencimento) {
-      return { ok: false, message: "Não consegui entender o novo vencimento." };
-    }
-
-    item.vencimento_falado = vencimento;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o vencimento do item ${idx + 1}.`
-    };
-  }
-
-  if (action === "update_payment") {
-    const forma = String(correction?.fields?.forma_pagamento_falada || "").trim();
-    if (!forma) {
-      return { ok: false, message: "Não consegui entender a nova forma de pagamento." };
-    }
-
-    item.forma_pagamento_falada = forma;
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi a forma de pagamento do item ${idx + 1}.`
-    };
+    item.cliente_falado = String(correction?.fields?.cliente_falado || "").trim();
+    return { ok: true, extraction: novo, message: `Corrigi o cliente do item ${idx + 1}.` };
   }
 
   if (action === "remove_item") {
     pedidos.splice(idx, 1);
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Removi o item ${idx + 1}.`
-    };
-  }
-
-  if (action === "replace_item_fields") {
-    const replacementPedido = correction?.replacement_pedido
-      ? normalizeSinglePedido(correction.replacement_pedido)
-      : null;
-
-    if (!replacementPedido) {
-      return {
-        ok: false,
-        message: "Não consegui entender a correção completa desse item."
-      };
-    }
-
-    pedidos[idx] = {
-      ...item,
-      ...replacementPedido,
-      cliente_falado: replacementPedido.cliente_falado || item.cliente_falado,
-      produto_falado: replacementPedido.produto_falado || item.produto_falado,
-      quantidade: replacementPedido.quantidade != null ? replacementPedido.quantidade : item.quantidade,
-      unidade: replacementPedido.unidade || item.unidade,
-      valor_falado: replacementPedido.valor_falado != null ? replacementPedido.valor_falado : item.valor_falado,
-      forma_pagamento_falada: replacementPedido.forma_pagamento_falada || item.forma_pagamento_falada,
-      vencimento_falado: replacementPedido.vencimento_falado || item.vencimento_falado,
-      data_falada: replacementPedido.data_falada || item.data_falada
-    };
-
-    return {
-      ok: true,
-      extraction: novo,
-      message: `Corrigi o item ${idx + 1} com a frase completa.`
-    };
+    return { ok: true, extraction: novo, message: `Removi o item ${idx + 1}.` };
   }
 
   return {
@@ -971,21 +953,9 @@ async function callGoogleAppsScript(payload) {
   }
 
   const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: { "Content-Type": "application/json" },
     validateStatus: () => true
   });
-
-  const contentType = resp.headers?.["content-type"] || "";
-  const bodyPreview =
-    typeof resp.data === "string"
-      ? resp.data.slice(0, 500)
-      : JSON.stringify(resp.data).slice(0, 500);
-
-  console.log("Apps Script status:", resp.status);
-  console.log("Apps Script content-type:", contentType);
-  console.log("Apps Script preview:", bodyPreview);
 
   return resp.data;
 }
@@ -1005,57 +975,21 @@ function formatGoogleSuccessMessage(gsResp) {
     const qtdSheet = r.quantidade_sheet != null ? String(r.quantidade_sheet) : "?";
     const valor = r.valor != null ? `R$ ${r.valor}` : "sem valor";
     const bloco = r.base_row != null ? `bloco ${r.base_row}` : "bloco ?";
-    const linha = r.linha_item != null ? ` | linha ${r.linha_item}` : "";
-    const forma = r.forma_pagamento || "PIX";
-    const venc = r.vencimento || "?";
-    const confianca =
-      r.confianca_produto != null ? ` | conf. produto ${r.confianca_produto}` : "";
-
-    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco}${linha} — ${forma} — venc. ${venc}${confianca}`;
+    return `${i + 1}. ${cliente} — ${produto} — ${qtdG} — sheet ${qtdSheet} — ${valor} — ${bloco}`;
   });
 
   return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
 }
 
-function formatDuplicateMessage(gsResp) {
-  const dup = Array.isArray(gsResp?.resultados)
-    ? gsResp.resultados.find((r) => r && r.possible_duplicate)
-    : null;
-
-  const primeira = dup && Array.isArray(dup.duplicatas) ? dup.duplicatas[0] : null;
-
-  return [
-    "Possível duplicata encontrada.",
-    "",
-    `Cliente: ${dup?.cliente_oficial || "?"}`,
-    `Produto: ${dup?.produto_oficial || "?"}`,
-    `Quantidade: ${dup?.quantidade_gramas || "?"}g`,
-    `Data: ${dup?.data_venda || "?"}`,
-    "",
-    `Registro já existente: ${primeira ? JSON.stringify(primeira) : "não detalhado"}`,
-    "",
-    "Se quiser lançar mesmo assim, responda: confirmar duplicata"
-  ].join("\n");
-}
-
 async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pending) {
-  if (!pending || isConfirmationText(incomingText) || isCancelText(incomingText)) {
-    return false;
-  }
+  if (!pending || isConfirmationText(incomingText) || isCancelText(incomingText)) return false;
 
   const correction = await interpretCorrectionFromText(incomingText, pending.extraction);
-
-  if (!correction?.is_correction) {
-    return false;
-  }
+  if (!correction?.is_correction) return false;
 
   const applied = await applyCorrectionToExtraction(pending.extraction, correction);
-
   if (!applied.ok) {
-    if (looksLikeFreshOrderMessage(incomingText)) {
-      return false;
-    }
-
+    if (looksLikeFreshOrderMessage(incomingText)) return false;
     await sendTelegramMessage(chatId, applied.message);
     return true;
   }
@@ -1077,6 +1011,11 @@ async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pend
   return true;
 }
 
+/**
+ * =========================================================
+ * ROTAS
+ * =========================================================
+ */
 app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
@@ -1105,7 +1044,6 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const text = (msg.text || msg.caption || "").trim();
 
-    // ===== RECEBIMENTOS: PDF / DOCUMENTO =====
     if (msg.document) {
       const isReceb = isRecebimentosIntent(text, msg);
 
@@ -1128,6 +1066,11 @@ app.post("/telegram/webhook", async (req, res) => {
       return;
     }
 
+    if (text) {
+      const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, text);
+      if (handledRecebimentosPending) return;
+    }
+
     if (text && isCancelText(text)) {
       clearPendingBatch(chatId);
       await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
@@ -1142,31 +1085,18 @@ app.post("/telegram/webhook", async (req, res) => {
         return;
       }
 
-      const pedidos = Array.isArray(pending.extraction?.pedidos)
-        ? pending.extraction.pedidos
-        : [];
-
-      const forceDuplicateConfirmed =
-        normalizeText(text) === "confirmar duplicata" ||
-        pending?.meta?.duplicateAwaitingForce === true;
+      const pedidos = Array.isArray(pending.extraction?.pedidos) ? pending.extraction.pedidos : [];
 
       const gsResp = await callGoogleAppsScript({
         action: "preencher_lote_v1",
         pedidos,
         meta: pending.meta || {},
-        force_duplicate_confirmed: forceDuplicateConfirmed
+        force_duplicate_confirmed: false
       });
 
       if (gsResp?.ok) {
         clearPendingBatch(chatId);
         await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
-      } else if (gsResp?.possible_duplicate) {
-        savePendingBatch(chatId, pending.extraction, {
-          ...(pending.meta || {}),
-          duplicateAwaitingForce: true
-        });
-
-        await sendTelegramMessage(chatId, formatDuplicateMessage(gsResp));
       } else {
         clearPendingBatch(chatId);
         await sendTelegramMessage(
@@ -1179,7 +1109,6 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     if (text) {
-      // ===== RECEBIMENTOS: TEXTO =====
       if (isRecebimentosIntent(text, msg)) {
         await handleRecebimentosMessage({
           message: msg,
@@ -1192,7 +1121,6 @@ app.post("/telegram/webhook", async (req, res) => {
       }
 
       const pending = getPendingBatch(chatId);
-
       const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
       if (handledCorrection) return;
 
@@ -1222,7 +1150,9 @@ app.post("/telegram/webhook", async (req, res) => {
         return;
       }
 
-      // ===== RECEBIMENTOS: ÁUDIO =====
+      const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, transcription);
+      if (handledRecebimentosPending) return;
+
       if (isRecebimentosIntent(transcription, msg)) {
         await handleRecebimentosMessage({
           message: msg,
@@ -1236,7 +1166,6 @@ app.post("/telegram/webhook", async (req, res) => {
       }
 
       const pending = getPendingBatch(chatId);
-
       const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
       if (handledCorrection) return;
 
