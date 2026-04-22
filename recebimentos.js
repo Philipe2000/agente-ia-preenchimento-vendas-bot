@@ -27,6 +27,7 @@ async function handleRecebimentosMessage(ctx) {
   };
 
   const result = await callRecebimentosWebApp(payload);
+  console.log("Recebimentos result:", JSON.stringify(result));
 
   const resumo = result?.message || "Recebimentos processados.";
   await sendTelegramMessage(chatId, resumo);
