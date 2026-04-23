@@ -1,4 +1,3 @@
- 
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
@@ -346,7 +345,13 @@ function normalizarExtracaoItauIA(parsed) {
           valor: item?.valor == null ? null : Number(item.valor),
           linha_resumo: item?.linha_resumo == null ? "" : String(item.linha_resumo).trim()
         }))
-        .filter((item) => item.tipo === "pix_recebido" && item.data_pagamento && Number.isFinite(item.valor) && item.valor > 0)
+        .filter(
+          (item) =>
+            item.tipo === "pix_recebido" &&
+            item.data_pagamento &&
+            Number.isFinite(item.valor) &&
+            item.valor > 0
+        )
     : [];
 
   return {
@@ -1084,16 +1089,17 @@ async function handleRecebimentosMessage(ctx) {
     return;
   }
 
- if (!result?.ok && result?.modo !== "pre_visualizacao") {
-  await sendTelegramMessage(
-    chatId,
-    result?.message || result?.error || "Não consegui processar os recebimentos."
-  );
-  return;
-}
+  if (!result?.ok && result?.modo !== "pre_visualizacao") {
+    await sendTelegramMessage(
+      chatId,
+      result?.message || result?.error || "Não consegui processar os recebimentos."
+    );
+    return;
+  }
 
-const resumo = result?.message || "Recebimentos processados.";
-await sendTelegramMessage(chatId, resumo);
+  const resumo = result?.message || "Recebimentos processados.";
+  await sendTelegramMessage(chatId, resumo);
+}
 
 /**
  * =========================================================
