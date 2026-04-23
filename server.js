@@ -996,26 +996,18 @@ async function handleRecebimentosMessage(ctx) {
     text,
     sendTelegramMessage,
     transcription,
-    documentText = ""
+    documentText = "",
+    documentJson = null
   } = ctx;
 
   const chatId = message.chat.id;
-  const loteAtual = getPendingRecebimentos(chatId);
-  const lastPdfCtx = getLastPdfContext(chatId);
-
-  let effectiveDocumentText = documentText || "";
 
   const parsed = parseRecebimentosIntent(text, message);
   parsed.origem = chooseRecebimentosOrigin({
     text,
     message,
-    documentText: effectiveDocumentText,
-    loteAtual
+    documentText
   });
-
-  if (!effectiveDocumentText && parsed.origem === "itau" && lastPdfCtx?.origem === "itau") {
-    effectiveDocumentText = String(lastPdfCtx.documentText || "");
-  }
 
   if (transcription) {
     await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
@@ -1037,8 +1029,9 @@ async function handleRecebimentosMessage(ctx) {
     periodo: parsed.periodo,
     telegram: {
       chat_id: chatId,
-      has_document: !!message.document || !!effectiveDocumentText,
-      document_text: effectiveDocumentText
+      has_document: !!message.document,
+      document_text: documentText || "",
+      document_json: documentJson
     },
     message_meta: {
       message_id: message.message_id || null,
@@ -1664,130 +1657,37 @@ app.post("/telegram/webhook", async (req, res) => {
   if (!isReceb) {
     await sendTelegramMessage(
       chatId,
-      "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'processa esse extrato' ou 'pega os últimos 3 dias'."
+      "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'preencha recebimentos últimos 7 dias'."
     );
     return;
   }
 
   let documentText = "";
+  let documentJson = null;
 
   if (looksLikePdfDocument(msg)) {
     const fileId = msg.document.file_id;
     const fileInfo = await getTelegramFile(fileId);
     const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+
     documentText = await extractTextFromPdfBuffer(pdfBuffer);
-    
-    if (documentText && looksLikeItauStatement(documentText)) {
-  saveLastPdfContext(chatId, {
-    origem: "itau",
-    documentText
-  });
-}
+
+    if (looksLikeItauStatement(documentText) || normalizeText(text).includes("itau")) {
+      documentJson = await extrairRecebimentosItauDoPdfComIA(
+        pdfBuffer,
+        msg.document.file_name || "extrato_itau.pdf"
+      );
+    }
   }
 
   await handleRecebimentosMessage({
     message: msg,
     text,
     sendTelegramMessage,
-    documentText
+    documentText,
+    documentJson
   });
-  return;
-}
 
-    if (text) {
-      const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, text);
-      if (handledRecebimentosPending) return;
-    }
-
-    if (text && isCancelText(text)) {
-      clearPendingBatch(chatId);
-      await sendTelegramMessage(chatId, "Lote pendente cancelado. Pode mandar um novo pedido.");
-      return;
-    }
-
-    if (text && isConfirmationText(text)) {
-      const pending = getPendingBatch(chatId);
-
-      if (!pending) {
-        await sendTelegramMessage(chatId, "Não encontrei nenhum lote pendente para confirmar.");
-        return;
-      }
-
-      const pedidos = Array.isArray(pending.extraction?.pedidos) ? pending.extraction.pedidos : [];
-
-      const gsResp = await callGoogleAppsScript({
-        action: "preencher_lote_v1",
-        pedidos,
-        meta: pending.meta || {},
-        force_duplicate_confirmed: false
-      });
-
-      if (gsResp?.ok) {
-        clearPendingBatch(chatId);
-        await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
-      } else {
-        clearPendingBatch(chatId);
-        await sendTelegramMessage(
-          chatId,
-          `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
-        );
-      }
-
-      return;
-    }
-
-    if (text) {
-  if (isRecebimentosIntent(text, msg)) {
-    await handleRecebimentosMessage({
-      message: msg,
-      text,
-      sendTelegramMessage,
-      documentText: ""
-    });
-    return;
-  }
-
-      const pending = getPendingBatch(chatId);
-      const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
-      if (handledCorrection) return;
-
-      const extraction = await extractOrdersFromText(text);
-      const resumo = summarizeOrders(extraction);
-
-      savePendingBatch(chatId, extraction, {
-        source: "text",
-        originalText: text,
-        duplicateAwaitingForce: false
-      });
-
-      await sendTelegramMessage(chatId, resumo);
-      return;
-    }
-
-    if (msg.voice || msg.audio) {
-      await sendTelegramMessage(chatId, "Recebi seu áudio. Vou transcrever e analisar.");
-
-      const fileId = msg.voice?.file_id || msg.audio?.file_id;
-      const fileInfo = await getTelegramFile(fileId);
-      const audioBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
-      const transcription = await transcribeAudioWithOpenAI(audioBuffer, "audio.ogg");
-
-      if (!transcription || !String(transcription).trim()) {
-        await sendTelegramMessage(chatId, "Não consegui transcrever esse áudio. Se quiser, mande de novo ou envie texto.");
-        return;
-      }
-
-      const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, transcription);
-      if (handledRecebimentosPending) return;
-
-      if (isRecebimentosIntent(transcription, msg)) {
-  await handleRecebimentosMessage({
-    message: msg,
-    text: transcription,
-    transcription,
-    sendTelegramMessage,
-    documentText: ""
-  });
   return;
 }
 
