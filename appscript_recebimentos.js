@@ -1,21 +1,19 @@
 const axios = require("axios");
 
-const GOOGLE_APPS_SCRIPT_WEBAPP_URL =
-  process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
+const GOOGLE_APPS_SCRIPT_RECEBIMENTOS_WEBAPP_URL =
+  process.env.GOOGLE_APPS_SCRIPT_RECEBIMENTOS_WEBAPP_URL || "";
 
 async function callRecebimentosWebApp(payload) {
-  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
-    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
+  if (!GOOGLE_APPS_SCRIPT_RECEBIMENTOS_WEBAPP_URL) {
+    throw new Error("GOOGLE_APPS_SCRIPT_RECEBIMENTOS_WEBAPP_URL não configurada.");
   }
 
-  const body = {
-    ...payload
-  };
+  const body = { ...payload };
 
   console.log("Recebimentos payload enviado ao Apps Script:");
   console.log(JSON.stringify(body, null, 2));
 
-  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, body, {
+  const resp = await axios.post(GOOGLE_APPS_SCRIPT_RECEBIMENTOS_WEBAPP_URL, body, {
     headers: {
       "Content-Type": "application/json"
     },
