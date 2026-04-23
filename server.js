@@ -8,6 +8,7 @@ const {
   parseRecebimentosIntent
 } = require("./intents_recebimentos");
 const { callRecebimentosWebApp } = require("./appscript_recebimentos");
+const { callVendasWebApp } = require("./appscript_vendas");
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -17,8 +18,6 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_TRANSCRIBE_MODEL =
   process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
-const GOOGLE_APPS_SCRIPT_WEBAPP_URL =
-  process.env.GOOGLE_APPS_SCRIPT_WEBAPP_URL || "";
 
 /**
  * =========================================================
@@ -1085,9 +1084,16 @@ async function handleRecebimentosMessage(ctx) {
     return;
   }
 
-  const resumo = result?.message || "Recebimentos processados.";
-  await sendTelegramMessage(chatId, resumo);
+ if (!result?.ok && result?.modo !== "pre_visualizacao") {
+  await sendTelegramMessage(
+    chatId,
+    result?.message || result?.error || "Não consegui processar os recebimentos."
+  );
+  return;
 }
+
+const resumo = result?.message || "Recebimentos processados.";
+await sendTelegramMessage(chatId, resumo);
 
 /**
  * =========================================================
@@ -1583,19 +1589,6 @@ async function applyCorrectionToExtraction(extraction, correction) {
   return { ok: false, message: "Não reconheci a ação de correção." };
 }
 
-async function callGoogleAppsScript(payload) {
-  if (!GOOGLE_APPS_SCRIPT_WEBAPP_URL) {
-    throw new Error("GOOGLE_APPS_SCRIPT_WEBAPP_URL não configurada.");
-  }
-
-  const resp = await axios.post(GOOGLE_APPS_SCRIPT_WEBAPP_URL, payload, {
-    headers: { "Content-Type": "application/json" },
-    validateStatus: () => true
-  });
-
-  return resp.data;
-}
-
 function formatGoogleSuccessMessage(gsResp) {
   const resultados = Array.isArray(gsResp?.resultados) ? gsResp.resultados : [];
   const okResults = resultados.filter((r) => r && r.ok);
@@ -1637,7 +1630,7 @@ async function confirmPendingSales(chatId, pending, forceDuplicateConfirmed = fa
   }
 
   const payload = buildVendasPayloadFromExtraction(extraction, forceDuplicateConfirmed);
-  const gsResp = await callGoogleAppsScript(payload);
+  const gsResp = await callVendasWebApp(payload);
 
   if (gsResp?.possible_duplicate && !forceDuplicateConfirmed) {
     savePendingBatch(chatId, extraction, {
