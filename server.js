@@ -26,6 +26,7 @@ const GOOGLE_APPS_SCRIPT_WEBAPP_URL =
  */
 const pendingBatches = new Map(); // vendas
 const pendingRecebimentos = new Map(); // recebimentos
+const lastPdfContextByChat = new Map();
 
 function savePendingRecebimentos(chatId, lote) {
   pendingRecebimentos.set(String(chatId), lote);
@@ -39,6 +40,20 @@ function clearPendingRecebimentos(chatId) {
   pendingRecebimentos.delete(String(chatId));
 }
 
+function saveLastPdfContext(chatId, ctx) {
+  lastPdfContextByChat.set(String(chatId), {
+    ...ctx,
+    savedAt: new Date().toISOString()
+  });
+}
+
+function getLastPdfContext(chatId) {
+  return lastPdfContextByChat.get(String(chatId)) || null;
+}
+
+function clearLastPdfContext(chatId) {
+  lastPdfContextByChat.delete(String(chatId));
+}
 /**
  * =========================================================
  * TELEGRAM
@@ -800,13 +815,22 @@ async function handleRecebimentosMessage(ctx) {
   } = ctx;
 
   const chatId = message.chat.id;
+  const loteAtual = getPendingRecebimentos(chatId);
+  const lastPdfCtx = getLastPdfContext(chatId);
+
+  let effectiveDocumentText = documentText || "";
 
   const parsed = parseRecebimentosIntent(text, message);
   parsed.origem = chooseRecebimentosOrigin({
     text,
     message,
-    documentText
+    documentText: effectiveDocumentText,
+    loteAtual
   });
+
+  if (!effectiveDocumentText && parsed.origem === "itau" && lastPdfCtx?.origem === "itau") {
+    effectiveDocumentText = String(lastPdfCtx.documentText || "");
+  }
 
   if (transcription) {
     await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
@@ -828,8 +852,8 @@ async function handleRecebimentosMessage(ctx) {
     periodo: parsed.periodo,
     telegram: {
       chat_id: chatId,
-      has_document: !!message.document,
-      document_text: documentText || ""
+      has_document: !!message.document || !!effectiveDocumentText,
+      document_text: effectiveDocumentText
     },
     message_meta: {
       message_id: message.message_id || null,
@@ -874,7 +898,6 @@ async function handleRecebimentosMessage(ctx) {
   const resumo = result?.message || "Recebimentos processados.";
   await sendTelegramMessage(chatId, resumo);
 }
-
 /**
  * =========================================================
  * VENDAS - CÓDIGO ATUAL
@@ -1468,6 +1491,13 @@ app.post("/telegram/webhook", async (req, res) => {
     const fileInfo = await getTelegramFile(fileId);
     const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
     documentText = await extractTextFromPdfBuffer(pdfBuffer);
+    
+    if (documentText && looksLikeItauStatement(documentText)) {
+  saveLastPdfContext(chatId, {
+    origem: "itau",
+    documentText
+  });
+}
   }
 
   await handleRecebimentosMessage({
