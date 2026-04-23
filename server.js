@@ -1677,6 +1677,8 @@ app.post("/telegram/webhook", async (req, res) => {
         pdfBuffer,
         msg.document.file_name || "extrato_itau.pdf"
       );
+      console.log("ITAU documentJson extraido pela IA:");
+console.log(JSON.stringify(documentJson, null, 2));
     }
   }
 
