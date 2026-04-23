@@ -1,6 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
+const pdfParse = require("pdf-parse");
 const {
   isRecebimentosIntent,
   parseRecebimentosIntent
@@ -76,6 +77,48 @@ async function downloadTelegramFileBuffer(filePath) {
   });
 
   return Buffer.from(resp.data);
+}
+
+/**
+ * =========================================================
+ * PDF - ITAÚ
+ * =========================================================
+ */
+async function extractTextFromPdfBuffer(buffer) {
+  const data = await pdfParse(buffer);
+  return String(data?.text || "").trim();
+}
+
+function looksLikePdfDocument(message = {}) {
+  const name = String(message?.document?.file_name || "").toLowerCase();
+  const mime = String(message?.document?.mime_type || "").toLowerCase();
+  return mime === "application/pdf" || name.endsWith(".pdf");
+}
+
+function looksLikeItauStatement(text) {
+  const t = normalizeText(text);
+  return (
+    t.includes("itau") &&
+    t.includes("lancamentos do periodo") &&
+    t.includes("agencia") &&
+    t.includes("conta") &&
+    t.includes("pix recebido")
+  );
+}
+
+function chooseRecebimentosOrigin({ text = "", message = {}, documentText = "" }) {
+  const t = normalizeText(text);
+  const pdfText = normalizeText(documentText);
+
+  if (looksLikePdfDocument(message) && looksLikeItauStatement(pdfText)) {
+    return "itau";
+  }
+
+  if (t.includes("itau") || t.includes("extrato")) {
+    return "itau";
+  }
+
+  return "inter";
 }
 
 /**
@@ -504,7 +547,7 @@ function buildForcedItemFromDuplicate(lote, duplicado) {
     data_pagamento: duplicado.data_pagamento || "",
     valor: duplicado.valor,
     forma: "PIX",
-    conta_oficial: "Inter Empresas",
+    conta_oficial: lote.origem === "itau" ? "Itaú Empresas" : "Inter Empresas",
     banco_extraido: duplicado.banco_extraido || "",
     id_transacao: duplicado.id_transacao || null,
     assunto_email: duplicado.assunto_email || "",
@@ -748,10 +791,22 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
  * =========================================================
  */
 async function handleRecebimentosMessage(ctx) {
-  const { message, text, sendTelegramMessage, transcription } = ctx;
+  const {
+    message,
+    text,
+    sendTelegramMessage,
+    transcription,
+    documentText = ""
+  } = ctx;
+
   const chatId = message.chat.id;
 
   const parsed = parseRecebimentosIntent(text, message);
+  parsed.origem = chooseRecebimentosOrigin({
+    text,
+    message,
+    documentText
+  });
 
   if (transcription) {
     await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
@@ -773,7 +828,8 @@ async function handleRecebimentosMessage(ctx) {
     periodo: parsed.periodo,
     telegram: {
       chat_id: chatId,
-      has_document: !!message.document
+      has_document: !!message.document,
+      document_text: documentText || ""
     },
     message_meta: {
       message_id: message.message_id || null,
@@ -1395,25 +1451,33 @@ app.post("/telegram/webhook", async (req, res) => {
     const text = (msg.text || msg.caption || "").trim();
 
     if (msg.document) {
-      const isReceb = isRecebimentosIntent(text, msg);
+  const isReceb = isRecebimentosIntent(text, msg);
 
-      if (!isReceb) {
-        await sendTelegramMessage(
-          chatId,
-          "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'processa esse extrato' ou 'pega os últimos 3 dias'."
-        );
-        return;
-      }
+  if (!isReceb) {
+    await sendTelegramMessage(
+      chatId,
+      "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'processa esse extrato' ou 'pega os últimos 3 dias'."
+    );
+    return;
+  }
 
-      await handleRecebimentosMessage({
-        message: msg,
-        text,
-        sendTelegramMessage,
-        getTelegramFile,
-        downloadTelegramFileBuffer
-      });
-      return;
-    }
+  let documentText = "";
+
+  if (looksLikePdfDocument(msg)) {
+    const fileId = msg.document.file_id;
+    const fileInfo = await getTelegramFile(fileId);
+    const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+    documentText = await extractTextFromPdfBuffer(pdfBuffer);
+  }
+
+  await handleRecebimentosMessage({
+    message: msg,
+    text,
+    sendTelegramMessage,
+    documentText
+  });
+  return;
+}
 
     if (text) {
       const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, text);
@@ -1458,16 +1522,15 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     if (text) {
-      if (isRecebimentosIntent(text, msg)) {
-        await handleRecebimentosMessage({
-          message: msg,
-          text,
-          sendTelegramMessage,
-          getTelegramFile,
-          downloadTelegramFileBuffer
-        });
-        return;
-      }
+  if (isRecebimentosIntent(text, msg)) {
+    await handleRecebimentosMessage({
+      message: msg,
+      text,
+      sendTelegramMessage,
+      documentText: ""
+    });
+    return;
+  }
 
       const pending = getPendingBatch(chatId);
       const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
@@ -1503,16 +1566,15 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(transcription, msg)) {
-        await handleRecebimentosMessage({
-          message: msg,
-          text: transcription,
-          transcription,
-          sendTelegramMessage,
-          getTelegramFile,
-          downloadTelegramFileBuffer
-        });
-        return;
-      }
+  await handleRecebimentosMessage({
+    message: msg,
+    text: transcription,
+    transcription,
+    sendTelegramMessage,
+    documentText: ""
+  });
+  return;
+}
 
       const pending = getPendingBatch(chatId);
       const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
