@@ -187,6 +187,191 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   return resp.data?.text || "";
 }
 
+async function extrairRecebimentosItauDoPdfComIA(pdfBuffer, filename = "extrato_itau.pdf") {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY não configurada.");
+  }
+
+  const model = process.env.OPENAI_ITAU_PDF_MODEL || "gpt-4.1-mini";
+  const base64Pdf = pdfBuffer.toString("base64");
+  const dataUrl = `data:application/pdf;base64,${base64Pdf}`;
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      banco: { type: "string" },
+      extrato_detectado: { type: "boolean" },
+      observacoes: { type: ["string", "null"] },
+      lancamentos: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            tipo: { type: "string" },
+            data_pagamento: { type: ["string", "null"] },
+            nome_pagador: { type: ["string", "null"] },
+            cpf_cnpj: { type: ["string", "null"] },
+            valor: { type: ["number", "null"] },
+            linha_resumo: { type: ["string", "null"] }
+          },
+          required: [
+            "tipo",
+            "data_pagamento",
+            "nome_pagador",
+            "cpf_cnpj",
+            "valor",
+            "linha_resumo"
+          ]
+        }
+      }
+    },
+    required: ["banco", "extrato_detectado", "observacoes", "lancamentos"]
+  };
+
+  const instructions = [
+    "Analise este PDF de extrato bancário.",
+    "Seu trabalho é identificar se o documento é um extrato do Itaú e extrair apenas recebimentos PIX.",
+    "",
+    "Regras obrigatórias:",
+    "- Retorne SOMENTE JSON válido no schema pedido.",
+    "- banco deve ser 'itau' se o extrato for do Itaú; caso contrário, use 'desconhecido'.",
+    "- extrato_detectado = true somente se realmente for extrato bancário.",
+    "- Inclua em lancamentos APENAS linhas de PIX RECEBIDO / recebimento PIX.",
+    "- Ignore PIX enviado, saldo, rendimento, pagamento QR code, depósito em dinheiro e outras movimentações que não sejam recebimento PIX.",
+    "- data_pagamento deve vir em formato ISO YYYY-MM-DD quando possível.",
+    "- valor deve ser número decimal, sem símbolo.",
+    "- nome_pagador deve ser o melhor nome possível da pessoa/empresa que pagou.",
+    "- cpf_cnpj pode ser null se não estiver claro.",
+    "- linha_resumo deve guardar um resumo curto da linha/origem do extrato.",
+    "",
+    "Contexto importante:",
+    "- O extrato pode estar visualmente quebrado.",
+    "- Se houver ruído na tabela, ainda assim tente reconstruir os lançamentos.",
+    "- Se houver dúvida, prefira incluir menos itens do que inventar.",
+    "",
+    "Exemplo de tipo válido:",
+    "- tipo: 'pix_recebido'"
+  ].join("\n");
+
+  const payload = {
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: instructions },
+          {
+            type: "input_file",
+            filename,
+            file_data: dataUrl
+          }
+        ]
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "itau_recebimentos_pdf",
+        strict: true,
+        schema
+      }
+    }
+  };
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/responses",
+    payload,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 180000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    }
+  );
+
+  const data = resp.data || {};
+  const outputText = extractResponsesOutputText(data);
+
+  if (!outputText) {
+    throw new Error("A OpenAI não retornou texto utilizável para o PDF do Itaú.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(outputText);
+  } catch (err) {
+    throw new Error("A OpenAI retornou JSON inválido para o PDF do Itaú: " + outputText);
+  }
+
+  return normalizarExtracaoItauIA(parsed);
+}
+
+function extractResponsesOutputText(data) {
+  if (data && data.output_text) {
+    return String(data.output_text).trim();
+  }
+
+  if (Array.isArray(data?.output)) {
+    for (const item of data.output) {
+      if (!item || !Array.isArray(item.content)) continue;
+      for (const c of item.content) {
+        if (c.type === "output_text" && c.text) {
+          return String(c.text).trim();
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
+function normalizarExtracaoItauIA(parsed) {
+  const banco = String(parsed?.banco || "").trim().toLowerCase();
+  const extratoDetectado = !!parsed?.extrato_detectado;
+  const observacoes = parsed?.observacoes == null ? null : String(parsed.observacoes);
+
+  const lancamentos = Array.isArray(parsed?.lancamentos)
+    ? parsed.lancamentos
+        .map((item) => ({
+          tipo: String(item?.tipo || "").trim().toLowerCase(),
+          data_pagamento: normalizarDataIsoIA(item?.data_pagamento),
+          nome_pagador: item?.nome_pagador == null ? "" : String(item.nome_pagador).trim(),
+          cpf_cnpj: item?.cpf_cnpj == null ? "" : String(item.cpf_cnpj).trim(),
+          valor: item?.valor == null ? null : Number(item.valor),
+          linha_resumo: item?.linha_resumo == null ? "" : String(item.linha_resumo).trim()
+        }))
+        .filter((item) => item.tipo === "pix_recebido" && item.data_pagamento && Number.isFinite(item.valor) && item.valor > 0)
+    : [];
+
+  return {
+    banco,
+    extrato_detectado: extratoDetectado,
+    observacoes,
+    lancamentos
+  };
+}
+
+function normalizarDataIsoIA(value) {
+  const s = String(value || "").trim();
+  if (!s) return "";
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    return s;
+  }
+
+  const br = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (br) {
+    return `${br[3]}-${br[2]}-${br[1]}`;
+  }
+
+  return "";
+}
+
 /**
  * =========================================================
  * UTIL GERAIS
