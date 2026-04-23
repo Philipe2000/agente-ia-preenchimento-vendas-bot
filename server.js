@@ -1,3 +1,4 @@
+ 
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
@@ -450,6 +451,16 @@ function isConfirmationText(text) {
     t === "confirmar sim" ||
     t === "confirme tudo" ||
     t === "confirmar duplicata"
+  );
+}
+
+function isDuplicateConfirmationText(text) {
+  const t = normalizeText(text);
+  return (
+    t === "confirmar duplicata" ||
+    t === "confirme duplicata" ||
+    t === "forcar duplicata" ||
+    t === "forçar duplicata"
   );
 }
 
@@ -1529,6 +1540,22 @@ async function applyCorrectionToExtraction(extraction, correction) {
     };
   }
 
+  if (correction?.action === "replace_item_fields") {
+    const idxReplace = Number(correction?.item_index || 0) - 1;
+    if (idxReplace < 0 || idxReplace >= pedidos.length) {
+      return { ok: false, message: "Não consegui identificar qual item substituir." };
+    }
+
+    const replacement = normalizeSinglePedido(correction?.replacement_pedido || {});
+    pedidos[idxReplace] = replacement;
+
+    return {
+      ok: true,
+      extraction: novo,
+      message: `Substituí o item ${idxReplace + 1} pelo novo conteúdo.`
+    };
+  }
+
   const idx = Number(correction?.item_index || 0) - 1;
   if (idx < 0 || idx >= pedidos.length) {
     return { ok: false, message: "Não consegui identificar qual item corrigir." };
@@ -1588,6 +1615,93 @@ function formatGoogleSuccessMessage(gsResp) {
   });
 
   return `Lote confirmado com sucesso.\n\n${linhas.join("\n")}`;
+}
+
+function buildVendasPayloadFromExtraction(extraction, forceDuplicateConfirmed = false) {
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
+  return {
+    action: "preencher_lote_v1",
+    pedidos,
+    ...(forceDuplicateConfirmed ? { force_duplicate_confirmed: true } : {})
+  };
+}
+
+async function confirmPendingSales(chatId, pending, forceDuplicateConfirmed = false) {
+  const extraction = normalizeExtraction(pending?.extraction || { pedidos: [] });
+  const pedidos = Array.isArray(extraction?.pedidos) ? extraction.pedidos : [];
+
+  if (!pedidos.length) {
+    clearPendingBatch(chatId);
+    await sendTelegramMessage(chatId, "Não há pedidos pendentes válidos para confirmar.");
+    return true;
+  }
+
+  const payload = buildVendasPayloadFromExtraction(extraction, forceDuplicateConfirmed);
+  const gsResp = await callGoogleAppsScript(payload);
+
+  if (gsResp?.possible_duplicate && !forceDuplicateConfirmed) {
+    savePendingBatch(chatId, extraction, {
+      ...(pending?.meta || {}),
+      duplicateAwaitingForce: true
+    });
+
+    const duplicatas = Array.isArray(gsResp?.resultados)
+      ? gsResp.resultados.filter((r) => r && r.possible_duplicate)
+      : [];
+
+    const linhas = [];
+    linhas.push("Encontrei possível duplicata no Google.");
+    linhas.push("Revise antes de forçar.");
+    linhas.push("");
+
+    duplicatas.slice(0, 10).forEach((r, idx) => {
+      linhas.push(
+        `${idx + 1}. ${r.cliente_oficial || "?"} | ${r.produto_oficial || "?"} | ${r.data_venda || "?"} | ${r.quantidade_gramas || "?"}g`
+      );
+    });
+
+    linhas.push("");
+    linhas.push("Se quiser gravar mesmo assim, responda: confirmar duplicata");
+    linhas.push("Se quiser cancelar, responda: cancelar");
+
+    await sendTelegramMessage(chatId, linhas.join("\n"));
+    return true;
+  }
+
+  if (!gsResp?.ok) {
+    await sendTelegramMessage(
+      chatId,
+      `O lote foi confirmado, mas houve falha ao enviar ao Google.\n\nResposta: ${JSON.stringify(gsResp).slice(0, 3500)}`
+    );
+    return true;
+  }
+
+  clearPendingBatch(chatId);
+  await sendTelegramMessage(chatId, formatGoogleSuccessMessage(gsResp));
+  return true;
+}
+
+async function tryHandlePendingSalesCommands(chatId, text) {
+  const pending = getPendingBatch(chatId);
+  if (!pending) return false;
+
+  const duplicateAwaitingForce = !!pending?.meta?.duplicateAwaitingForce;
+
+  if (isCancelText(text)) {
+    clearPendingBatch(chatId);
+    await sendTelegramMessage(chatId, "Lote de vendas cancelado.");
+    return true;
+  }
+
+  if (duplicateAwaitingForce && isDuplicateConfirmationText(text)) {
+    return confirmPendingSales(chatId, pending, true);
+  }
+
+  if (isConfirmationText(text)) {
+    return confirmPendingSales(chatId, pending, false);
+  }
+
+  return false;
 }
 
 async function handlePotentialCorrection(chatId, incomingText, sourceLabel, pending) {
@@ -1686,6 +1800,12 @@ app.post("/telegram/webhook", async (req, res) => {
           console.log("ITAU documentJson extraido pela IA:");
           console.log(JSON.stringify(documentJson, null, 2));
         }
+
+        saveLastPdfContext(chatId, {
+          file_name: msg.document.file_name || "",
+          documentText,
+          documentJson
+        });
       }
 
       await handleRecebimentosMessage({
@@ -1722,16 +1842,21 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(transcription, msg)) {
+        const lastPdf = getLastPdfContext(chatId);
+
         await handleRecebimentosMessage({
           message: msg,
           text: transcription,
           transcription,
           sendTelegramMessage,
-          documentText: "",
-          documentJson: null
+          documentText: lastPdf?.documentText || "",
+          documentJson: lastPdf?.documentJson || null
         });
         return;
       }
+
+      const handledSalesPending = await tryHandlePendingSalesCommands(chatId, transcription);
+      if (handledSalesPending) return;
 
       const pending = getPendingBatch(chatId);
       const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
@@ -1758,15 +1883,20 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(text, msg)) {
+        const lastPdf = getLastPdfContext(chatId);
+
         await handleRecebimentosMessage({
           message: msg,
           text,
           sendTelegramMessage,
-          documentText: "",
-          documentJson: null
+          documentText: lastPdf?.documentText || "",
+          documentJson: lastPdf?.documentJson || null
         });
         return;
       }
+
+      const handledSalesPending = await tryHandlePendingSalesCommands(chatId, text);
+      if (handledSalesPending) return;
 
       const pending = getPendingBatch(chatId);
       const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
@@ -1807,4 +1937,3 @@ app.post("/telegram/webhook", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor online na porta ${PORT}`);
 });
-     
