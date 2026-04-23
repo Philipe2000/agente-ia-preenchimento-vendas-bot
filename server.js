@@ -54,6 +54,7 @@ function getLastPdfContext(chatId) {
 function clearLastPdfContext(chatId) {
   lastPdfContextByChat.delete(String(chatId));
 }
+
 /**
  * =========================================================
  * TELEGRAM
@@ -1076,6 +1077,7 @@ async function handleRecebimentosMessage(ctx) {
   const resumo = result?.message || "Recebimentos processados.";
   await sendTelegramMessage(chatId, resumo);
 }
+
 /**
  * =========================================================
  * VENDAS - CÓDIGO ATUAL
@@ -1651,47 +1653,85 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const text = (msg.text || msg.caption || "").trim();
 
+    // =====================================================
+    // DOCUMENTO / PDF
+    // =====================================================
     if (msg.document) {
-  const isReceb = isRecebimentosIntent(text, msg);
+      const isReceb = isRecebimentosIntent(text, msg);
 
-  if (!isReceb) {
-    await sendTelegramMessage(
-      chatId,
-      "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'preencha recebimentos últimos 7 dias'."
-    );
-    return;
-  }
+      if (!isReceb) {
+        await sendTelegramMessage(
+          chatId,
+          "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'preencha recebimentos últimos 7 dias'."
+        );
+        return;
+      }
 
-  let documentText = "";
-  let documentJson = null;
+      let documentText = "";
+      let documentJson = null;
 
-  if (looksLikePdfDocument(msg)) {
-    const fileId = msg.document.file_id;
-    const fileInfo = await getTelegramFile(fileId);
-    const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+      if (looksLikePdfDocument(msg)) {
+        const fileId = msg.document.file_id;
+        const fileInfo = await getTelegramFile(fileId);
+        const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
 
-    documentText = await extractTextFromPdfBuffer(pdfBuffer);
+        documentText = await extractTextFromPdfBuffer(pdfBuffer);
 
-    if (looksLikeItauStatement(documentText) || normalizeText(text).includes("itau")) {
-      documentJson = await extrairRecebimentosItauDoPdfComIA(
-        pdfBuffer,
-        msg.document.file_name || "extrato_itau.pdf"
-      );
-      console.log("ITAU documentJson extraido pela IA:");
-console.log(JSON.stringify(documentJson, null, 2));
+        if (looksLikeItauStatement(documentText) || normalizeText(text).includes("itau")) {
+          documentJson = await extrairRecebimentosItauDoPdfComIA(
+            pdfBuffer,
+            msg.document.file_name || "extrato_itau.pdf"
+          );
+
+          console.log("ITAU documentJson extraido pela IA:");
+          console.log(JSON.stringify(documentJson, null, 2));
+        }
+      }
+
+      await handleRecebimentosMessage({
+        message: msg,
+        text,
+        sendTelegramMessage,
+        documentText,
+        documentJson
+      });
+
+      return;
     }
-  }
 
-  await handleRecebimentosMessage({
-    message: msg,
-    text,
-    sendTelegramMessage,
-    documentText,
-    documentJson
-  });
+    // =====================================================
+    // ÁUDIO
+    // =====================================================
+    if (msg.voice || msg.audio) {
+      await sendTelegramMessage(chatId, "Recebi seu áudio. Vou transcrever e analisar.");
 
-  return;
-}
+      const fileId = msg.voice?.file_id || msg.audio?.file_id;
+      const fileInfo = await getTelegramFile(fileId);
+      const audioBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+      const transcription = await transcribeAudioWithOpenAI(audioBuffer, "audio.ogg");
+
+      if (!transcription || !String(transcription).trim()) {
+        await sendTelegramMessage(
+          chatId,
+          "Não consegui transcrever esse áudio. Mande de novo ou envie em texto."
+        );
+        return;
+      }
+
+      const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, transcription);
+      if (handledRecebimentosPending) return;
+
+      if (isRecebimentosIntent(transcription, msg)) {
+        await handleRecebimentosMessage({
+          message: msg,
+          text: transcription,
+          transcription,
+          sendTelegramMessage,
+          documentText: "",
+          documentJson: null
+        });
+        return;
+      }
 
       const pending = getPendingBatch(chatId);
       const handledCorrection = await handlePotentialCorrection(chatId, transcription, "audio", pending);
@@ -1707,6 +1747,40 @@ console.log(JSON.stringify(documentJson, null, 2));
 
       const resumo = summarizeOrders(extraction);
       await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"\n\n${resumo}`);
+      return;
+    }
+
+    // =====================================================
+    // TEXTO
+    // =====================================================
+    if (text) {
+      const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, text);
+      if (handledRecebimentosPending) return;
+
+      if (isRecebimentosIntent(text, msg)) {
+        await handleRecebimentosMessage({
+          message: msg,
+          text,
+          sendTelegramMessage,
+          documentText: "",
+          documentJson: null
+        });
+        return;
+      }
+
+      const pending = getPendingBatch(chatId);
+      const handledCorrection = await handlePotentialCorrection(chatId, text, "text", pending);
+      if (handledCorrection) return;
+
+      const extraction = await extractOrdersFromText(text);
+
+      savePendingBatch(chatId, extraction, {
+        source: "text",
+        duplicateAwaitingForce: false
+      });
+
+      const resumo = summarizeOrders(extraction);
+      await sendTelegramMessage(chatId, resumo);
       return;
     }
 
