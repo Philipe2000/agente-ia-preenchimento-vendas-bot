@@ -101,11 +101,12 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "preencha recebimentos dia 18/04, 19/04, 20/04",
       "associar P1 Diergia",
       "associar Karolaine a Ricardo",
+      "liberar duplicata D1",
       "confirmar lote",
       "cancelar lote",
       "remover 5",
       "Datas podem aparecer como 18/04, 18-04, 19/04, 20/04.",
-      "Se houver código como P1, P2, I1, I2, preserve exatamente.",
+      "Se houver código como P1, P2, I1, I2, D1, D2, preserve exatamente.",
       "Se houver valor monetário, preserve os números com máxima fidelidade.",
       "Nomes frequentes de clientes e pessoas:",
       "Diergia, Ricardo, Sandro, Larissa, Raquel, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu."
@@ -190,6 +191,35 @@ function similarityScore(a, b) {
   const dist = levenshtein(x, y);
   const maxLen = Math.max(x.length, y.length);
   return maxLen ? 1 - dist / maxLen : 0;
+}
+
+function isConfirmationText(text) {
+  const t = normalizeText(text);
+  return (
+    t === "sim" ||
+    t === "ok" ||
+    t === "certo" ||
+    t === "isso" ||
+    t === "confirmar" ||
+    t === "pode confirmar" ||
+    t === "confirme" ||
+    t === "confirmar sim" ||
+    t === "confirme tudo" ||
+    t === "confirmar duplicata"
+  );
+}
+
+function isCancelText(text) {
+  const t = normalizeText(text);
+  return (
+    t === "cancelar" ||
+    t === "cancelar lote" ||
+    t === "limpar" ||
+    t === "limpar lote" ||
+    t === "comecar de novo" ||
+    t === "recomecar" ||
+    t === "apagar lote"
+  );
 }
 
 /**
@@ -295,7 +325,6 @@ async function resolveClienteOficialViaAppsScript(nomeFalado) {
 function parseAssociarPendenciaCommand(text, lote = null) {
   const raw = String(text || "").trim();
 
-  // Ex.: associar P1 Ricardo
   let m = raw.match(/^associar\s+(P\d+)\s+(.+)$/i);
   if (m) {
     return {
@@ -304,7 +333,6 @@ function parseAssociarPendenciaCommand(text, lote = null) {
     };
   }
 
-  // Ex.: associar Karolaine a Ricardo
   m = raw.match(/^associar\s+(.+?)\s+(?:a|ao)\s+(.+)$/i);
   if (m && lote) {
     const nomeFalado = normalizeText(m[1]);
@@ -338,6 +366,22 @@ function parseRemoverRecebimentoCommand(text) {
 
   m = raw.match(/^remove(?:r)?\s+(?:item\s+)?(\d+)[.!?]?$/i);
   if (m) return { itemNumero: Number(m[1]) };
+
+  return null;
+}
+
+function parseLiberarDuplicataCommand(text) {
+  const raw = String(text || "").trim();
+
+  let m = raw.match(/^liberar\s+duplicata\s+(D\d+)[.!?]?$/i);
+  if (m) {
+    return { duplicataId: String(m[1]).toUpperCase() };
+  }
+
+  m = raw.match(/^libera(?:r)?\s+(D\d+)[.!?]?$/i);
+  if (m) {
+    return { duplicataId: String(m[1]).toUpperCase() };
+  }
 
   return null;
 }
@@ -386,8 +430,10 @@ function summarizePendingRecebimentos(lote) {
   if (prontos.length) {
     linhas.push("", "Prontos:");
     prontos.forEach((item, idx) => {
+      let extra = "";
+      if (item.force_duplicate) extra = " | duplicata liberada";
       linhas.push(
-        `${idx + 1}. ${item.cliente_oficial} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}`
+        `${idx + 1}. ${item.cliente_oficial} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}${extra}`
       );
     });
   }
@@ -396,11 +442,8 @@ function summarizePendingRecebimentos(lote) {
     linhas.push("", "Pendências:");
     pendencias.forEach((item) => {
       let extra = "";
-      if (item.gc_ambiguo) {
-        extra = " | GC ambíguo";
-      } else if (item.erro) {
-        extra = ` | ${item.erro}`;
-      }
+      if (item.gc_ambiguo) extra = " | GC ambíguo";
+      else if (item.erro) extra = ` | ${item.erro}`;
 
       linhas.push(
         `${item.id_local}. ${item.nome_extraido} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}${extra}`
@@ -410,7 +453,7 @@ function summarizePendingRecebimentos(lote) {
 
   if (duplicados.length) {
     linhas.push("", "Duplicados:");
-    duplicados.forEach((item, idx) => {
+    duplicados.forEach((item) => {
       const motivo = String(item.motivo || "");
       let origemDup = "duplicado";
 
@@ -429,7 +472,7 @@ function summarizePendingRecebimentos(lote) {
       }
 
       linhas.push(
-        `${idx + 1}. ${origemDup} | ${cliente} | ${data} | ${valor}${extra}`
+        `${item.id_local}. ${origemDup} | ${cliente} | ${data} | ${valor}${extra}`
       );
     });
   }
@@ -437,6 +480,7 @@ function summarizePendingRecebimentos(lote) {
   linhas.push("", "Comandos:");
   linhas.push("- associar P1 NOME_DO_CLIENTE_OFICIAL");
   linhas.push("- ou: associar NOME_DA_PENDENCIA a NOME_DO_CLIENTE_OFICIAL");
+  linhas.push("- liberar duplicata D1");
   linhas.push("- remover 5");
   linhas.push("- confirmar lote");
   linhas.push("- cancelar lote");
@@ -444,11 +488,36 @@ function summarizePendingRecebimentos(lote) {
   linhas.push("Exemplos:");
   linhas.push("- associar P1 Diergia");
   linhas.push("- associar Karolaine a Ricardo");
+  linhas.push("- liberar duplicata D1");
   linhas.push("");
   linhas.push("Faça uma associação por vez.");
   linhas.push("Você pode usar qualquer cliente oficial do MAPA_CLIENTES.");
 
   return linhas.join("\n");
+}
+
+function buildForcedItemFromDuplicate(lote, duplicado) {
+  return {
+    id_local: `I${(lote.itens_prontos?.length || 0) + 1}`,
+    cliente_oficial: duplicado.cliente_oficial || duplicado.nome_extraido || "",
+    nome_extraido: duplicado.nome_extraido || duplicado.cliente_oficial || "",
+    data_pagamento: duplicado.data_pagamento || "",
+    valor: duplicado.valor,
+    forma: "PIX",
+    conta_oficial: "Inter Empresas",
+    banco_extraido: duplicado.banco_extraido || "",
+    id_transacao: duplicado.id_transacao || null,
+    assunto_email: duplicado.assunto_email || "",
+    remetente: duplicado.remetente || "",
+    message_id: duplicado.message_id || "",
+    status: "pronto",
+    force_duplicate: true,
+    duplicate_source: duplicado.motivo || "duplicado_gc",
+    duplicate_reference: {
+      gc_recebimento_id: duplicado.gc_recebimento_id || null,
+      gc_recebimento_codigo: duplicado.gc_recebimento_codigo || null
+    }
+  };
 }
 
 async function tryHandleRecebimentosPendingCommands(chatId, text) {
@@ -463,6 +532,44 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
     return true;
   }
 
+  const liberarDuplicata = parseLiberarDuplicataCommand(text);
+  if (liberarDuplicata) {
+    const duplicados = Array.isArray(lote.duplicados) ? lote.duplicados : [];
+    const idx = duplicados.findIndex(
+      (d) => String(d.id_local || "").toUpperCase() === liberarDuplicata.duplicataId
+    );
+
+    if (idx < 0) {
+      await sendTelegramMessage(chatId, `Não encontrei a duplicata ${liberarDuplicata.duplicataId}.`);
+      return true;
+    }
+
+    const duplicado = duplicados[idx];
+    const itemPronto = buildForcedItemFromDuplicate(lote, duplicado);
+
+    lote.duplicados.splice(idx, 1);
+    lote.itens_prontos.push(itemPronto);
+    lote.historico_comandos.push({
+      tipo: "liberacao_duplicata",
+      duplicata_id: liberarDuplicata.duplicataId,
+      cliente_oficial: itemPronto.cliente_oficial,
+      em: new Date().toISOString()
+    });
+
+    savePendingRecebimentos(chatId, lote);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        "Duplicata liberada manualmente:",
+        `${liberarDuplicata.duplicataId} -> ${itemPronto.cliente_oficial} | ${itemPronto.data_pagamento} | ${formatMoneyBRL(itemPronto.valor)}`,
+        "",
+        summarizePendingRecebimentos(lote)
+      ].join("\n")
+    );
+    return true;
+  }
+
   const associar = parseAssociarPendenciaCommand(text, lote);
   if (associar) {
     if (!associar.clienteOficial) {
@@ -470,7 +577,6 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
       return true;
     }
 
-    // 1) tenta resolver usando a lista real do MAPA_CLIENTES
     const resolved = await resolveClienteOficialViaAppsScript(associar.clienteOficial);
 
     if (resolved?.ok && resolved?.encontrado && resolved?.cliente_oficial) {
@@ -502,7 +608,6 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
     let result = await callRecebimentosWebApp(payload);
     console.log("Recebimentos associar result:", JSON.stringify(result));
 
-    // 2) se ainda falhou, tenta resolver de novo com texto limpo
     if (!result?.ok) {
       const secondTry = await resolveClienteOficialViaAppsScript(
         limparClienteOficialFalado(associar.clienteOficial)
@@ -680,6 +785,11 @@ async function handleRecebimentosMessage(ctx) {
   console.log("Recebimentos result:", JSON.stringify(result));
 
   if (result?.modo === "pre_visualizacao") {
+    const duplicadosComId = (result.duplicados || []).map((d, idx) => ({
+      ...d,
+      id_local: `D${idx + 1}`
+    }));
+
     const lote = {
       tipo: "recebimentos_lote_pendente",
       origem: result.origem || parsed.origem,
@@ -688,14 +798,14 @@ async function handleRecebimentosMessage(ctx) {
       resumoOrigem: {
         processados_detectados: (result.itens_prontos || []).length,
         ignorados: (result.ignorados || []).length,
-        duplicados: (result.duplicados || []).length,
+        duplicados: duplicadosComId.length,
         ja_processados: (result.ja_processados || []).length,
         erros: (result.pendencias_associacao || []).length
       },
       itens_prontos: result.itens_prontos || [],
       pendencias_associacao: result.pendencias_associacao || [],
       ignorados: result.ignorados || [],
-      duplicados: result.duplicados || [],
+      duplicados: duplicadosComId,
       ja_processados: result.ja_processados || [],
       historico_comandos: []
     };
@@ -716,7 +826,6 @@ async function handleRecebimentosMessage(ctx) {
  */
 function looksLikeFreshOrderMessage(text) {
   const t = normalizeText(text);
-
   return (
     t.includes("comprou") ||
     t.includes("pedido") ||
@@ -770,16 +879,12 @@ function normalizeDateValue(rawText) {
   const t = normalizeText(original);
   const now = new Date();
 
-  if (t === "hoje") {
-    return formatDateToIso(now);
-  }
-
+  if (t === "hoje") return formatDateToIso(now);
   if (t === "ontem") {
     const d = new Date(now);
     d.setDate(d.getDate() - 1);
     return formatDateToIso(d);
   }
-
   if (t === "antes de ontem") {
     const d = new Date(now);
     d.setDate(d.getDate() - 2);
@@ -853,9 +958,7 @@ function inferGlobalContextFromText(text) {
   };
 
   const payment = parsePaymentText(original);
-  if (payment) {
-    context.forma_pagamento_falada = payment;
-  }
+  if (payment) context.forma_pagamento_falada = payment;
 
   const explicitDates = [];
   const reFull = /\b(\d{1,2}\/\d{1,2}\/\d{4})\b/g;
@@ -1157,28 +1260,19 @@ async function applyCorrectionToExtraction(extraction, correction) {
     const novosPedidos = Array.isArray(replacement?.pedidos) ? replacement.pedidos : [];
 
     if (!novosPedidos.length) {
-      return {
-        ok: false,
-        message: "Não consegui entender o novo lote completo."
-      };
+      return { ok: false, message: "Não consegui entender o novo lote completo." };
     }
 
     return {
       ok: true,
-      extraction: {
-        ...novo,
-        pedidos: novosPedidos
-      },
+      extraction: { ...novo, pedidos: novosPedidos },
       message: `Substituí o lote inteiro por ${novosPedidos.length} pedido(s).`
     };
   }
 
   const idx = Number(correction?.item_index || 0) - 1;
   if (idx < 0 || idx >= pedidos.length) {
-    return {
-      ok: false,
-      message: "Não consegui identificar qual item corrigir."
-    };
+    return { ok: false, message: "Não consegui identificar qual item corrigir." };
   }
 
   const item = pedidos[idx];
@@ -1200,10 +1294,7 @@ async function applyCorrectionToExtraction(extraction, correction) {
     return { ok: true, extraction: novo, message: `Removi o item ${idx + 1}.` };
   }
 
-  return {
-    ok: false,
-    message: "Não reconheci a ação de correção."
-  };
+  return { ok: false, message: "Não reconheci a ação de correção." };
 }
 
 async function callGoogleAppsScript(payload) {
