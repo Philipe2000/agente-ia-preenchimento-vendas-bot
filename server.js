@@ -27,6 +27,11 @@ const pendingBatches = new Map(); // vendas
 const pendingRecebimentos = new Map(); // recebimentos
 const lastPdfContextByChat = new Map();
 
+/**
+ * =========================================================
+ * RECEBIMENTOS - ESTADO
+ * =========================================================
+ */
 function savePendingRecebimentos(chatId, lote) {
   pendingRecebimentos.set(String(chatId), lote);
 }
@@ -52,6 +57,21 @@ function getLastPdfContext(chatId) {
 
 function clearLastPdfContext(chatId) {
   lastPdfContextByChat.delete(String(chatId));
+}
+
+function isFreshLastPdfContext(ctx, maxMinutes = 30) {
+  if (!ctx?.savedAt) return false;
+  const savedAt = new Date(ctx.savedAt).getTime();
+  if (!Number.isFinite(savedAt)) return false;
+  const ageMs = Date.now() - savedAt;
+  return ageMs <= maxMinutes * 60 * 1000;
+}
+
+function getUsableLastPdfContext(chatId, maxMinutes = 30) {
+  const ctx = getLastPdfContext(chatId);
+  if (!ctx) return null;
+  if (!isFreshLastPdfContext(ctx, maxMinutes)) return null;
+  return ctx;
 }
 
 /**
@@ -129,6 +149,10 @@ function chooseRecebimentosOrigin({ text = "", message = {}, documentText = "" }
     return "itau";
   }
 
+  if (pdfText && looksLikeItauStatement(pdfText)) {
+    return "itau";
+  }
+
   if (t.includes("itau") || t.includes("extrato")) {
     return "itau";
   }
@@ -136,11 +160,6 @@ function chooseRecebimentosOrigin({ text = "", message = {}, documentText = "" }
   return "inter";
 }
 
-/**
- * =========================================================
- * OPENAI - TRANSCRIÇÃO
- * =========================================================
- */
 async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
   const form = new FormData();
   form.append("file", buffer, filename);
@@ -842,7 +861,7 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
       associar.clienteOficial = resolved.cliente_oficial;
     }
 
-    const pendencias = Array.isArray(lote.pendencias_associacao)
+    const pendencias = Array.isArray(lote?.pendencias_associacao)
       ? lote.pendencias_associacao
       : [];
     const idx = pendencias.findIndex(
@@ -1003,9 +1022,19 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
 
 /**
  * =========================================================
- * RECEBIMENTOS - HANDLER PRINCIPAL
+ * RECEBIMENTOS - FLUXO ITAÚ
  * =========================================================
  */
+function buildSyntheticMessageWithDocument(msg, fileName = "extrato_itau.pdf") {
+  return {
+    ...msg,
+    document: {
+      file_name: fileName,
+      mime_type: "application/pdf"
+    }
+  };
+}
+
 async function handleRecebimentosMessage(ctx) {
   const {
     message,
@@ -1017,7 +1046,6 @@ async function handleRecebimentosMessage(ctx) {
   } = ctx;
 
   const chatId = message.chat.id;
-
   const parsed = parseRecebimentosIntent(text, message);
   parsed.origem = chooseRecebimentosOrigin({
     text,
@@ -1027,6 +1055,14 @@ async function handleRecebimentosMessage(ctx) {
 
   if (transcription) {
     await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
+  }
+
+  if (parsed.origem === "itau" && !documentJson) {
+    await sendTelegramMessage(
+      chatId,
+      "Recebi seu comando de recebimentos Itaú, mas ainda não tenho um PDF do Itaú estruturado para usar. Envie primeiro o PDF do extrato e depois diga, por exemplo: 'preencher recebimentos Itaú últimos 7 dias'."
+    );
+    return;
   }
 
   await sendTelegramMessage(
@@ -1045,7 +1081,7 @@ async function handleRecebimentosMessage(ctx) {
     periodo: parsed.periodo,
     telegram: {
       chat_id: chatId,
-      has_document: !!message.document,
+      has_document: !!message.document || !!documentJson || !!documentText,
       document_text: documentText || "",
       document_json: documentJson
     },
@@ -1770,27 +1806,34 @@ app.post("/telegram/webhook", async (req, res) => {
     // DOCUMENTO / PDF
     // =====================================================
     if (msg.document) {
-      const isReceb = isRecebimentosIntent(text, msg);
+      const explicitIntentInCaption = !!text && isRecebimentosIntent(text, msg);
 
-      if (!isReceb) {
+      if (!looksLikePdfDocument(msg)) {
         await sendTelegramMessage(
           chatId,
-          "Recebi um arquivo. Se isso for um extrato de recebimentos, me diga algo como: 'preencha recebimentos últimos 7 dias'."
+          "Recebi um arquivo. Se isso for um extrato de recebimentos, envie em PDF."
         );
         return;
       }
 
+      const fileId = msg.document.file_id;
+      const fileInfo = await getTelegramFile(fileId);
+      const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+
       let documentText = "";
       let documentJson = null;
 
-      if (looksLikePdfDocument(msg)) {
-        const fileId = msg.document.file_id;
-        const fileInfo = await getTelegramFile(fileId);
-        const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
-
+      try {
         documentText = await extractTextFromPdfBuffer(pdfBuffer);
+      } catch (err) {
+        console.error("Falha ao extrair texto do PDF:", err?.message || err);
+      }
 
-        if (looksLikeItauStatement(documentText) || normalizeText(text).includes("itau")) {
+      const itauDetected =
+        looksLikeItauStatement(documentText) || normalizeText(text).includes("itau");
+
+      if (itauDetected) {
+        try {
           documentJson = await extrairRecebimentosItauDoPdfComIA(
             pdfBuffer,
             msg.document.file_name || "extrato_itau.pdf"
@@ -1798,13 +1841,55 @@ app.post("/telegram/webhook", async (req, res) => {
 
           console.log("ITAU documentJson extraido pela IA:");
           console.log(JSON.stringify(documentJson, null, 2));
+        } catch (err) {
+          console.error("Falha ao estruturar PDF Itaú com IA:", err?.message || err);
         }
 
         saveLastPdfContext(chatId, {
+          origem: "itau",
           file_name: msg.document.file_name || "",
           documentText,
           documentJson
         });
+
+        if (!explicitIntentInCaption) {
+          if (documentJson?.extrato_detectado) {
+            await sendTelegramMessage(
+              chatId,
+              "Recebi o PDF do Itaú e já deixei tudo pronto. Agora me diga o período, por exemplo:\n- preencher recebimentos Itaú hoje\n- preencher recebimentos Itaú últimos 7 dias"
+            );
+          } else {
+            await sendTelegramMessage(
+              chatId,
+              "Recebi o PDF, mas não consegui estruturar o extrato do Itaú com segurança ainda. Tente enviar novamente ou mande outro PDF."
+            );
+          }
+          return;
+        }
+
+        const syntheticMsg = buildSyntheticMessageWithDocument(
+          msg,
+          msg.document.file_name || "extrato_itau.pdf"
+        );
+
+        await handleRecebimentosMessage({
+          message: syntheticMsg,
+          text,
+          sendTelegramMessage,
+          documentText,
+          documentJson
+        });
+        return;
+      }
+
+      const isReceb = explicitIntentInCaption || isRecebimentosIntent(text, msg);
+
+      if (!isReceb) {
+        await sendTelegramMessage(
+          chatId,
+          "Recebi um PDF. Se isso for um extrato de recebimentos, me diga algo como: 'preencher recebimentos últimos 7 dias'."
+        );
+        return;
       }
 
       await handleRecebimentosMessage({
@@ -1814,7 +1899,6 @@ app.post("/telegram/webhook", async (req, res) => {
         documentText,
         documentJson
       });
-
       return;
     }
 
@@ -1841,10 +1925,28 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(transcription, msg)) {
-        const lastPdf = getLastPdfContext(chatId);
+        const lastPdf = getUsableLastPdfContext(chatId);
+
+        const origemFromContext = chooseRecebimentosOrigin({
+          text: transcription,
+          message: lastPdf?.documentJson
+            ? buildSyntheticMessageWithDocument(msg, lastPdf?.file_name || "extrato_itau.pdf")
+            : msg,
+          documentText: lastPdf?.documentText || ""
+        });
+
+        if (origemFromContext === "itau" && !lastPdf?.documentJson) {
+          await sendTelegramMessage(
+            chatId,
+            `Transcrição:\n"${transcription}"\n\nRecebi seu comando de Itaú, mas ainda não tenho um PDF do Itaú pronto para usar. Envie primeiro o PDF do extrato e depois repita o comando.`
+          );
+          return;
+        }
 
         await handleRecebimentosMessage({
-          message: msg,
+          message: lastPdf?.documentJson
+            ? buildSyntheticMessageWithDocument(msg, lastPdf?.file_name || "extrato_itau.pdf")
+            : msg,
           text: transcription,
           transcription,
           sendTelegramMessage,
@@ -1882,10 +1984,28 @@ app.post("/telegram/webhook", async (req, res) => {
       if (handledRecebimentosPending) return;
 
       if (isRecebimentosIntent(text, msg)) {
-        const lastPdf = getLastPdfContext(chatId);
+        const lastPdf = getUsableLastPdfContext(chatId);
+
+        const origemFromContext = chooseRecebimentosOrigin({
+          text,
+          message: lastPdf?.documentJson
+            ? buildSyntheticMessageWithDocument(msg, lastPdf?.file_name || "extrato_itau.pdf")
+            : msg,
+          documentText: lastPdf?.documentText || ""
+        });
+
+        if (origemFromContext === "itau" && !lastPdf?.documentJson) {
+          await sendTelegramMessage(
+            chatId,
+            "Recebi seu comando de recebimentos Itaú, mas ainda não tenho um PDF do Itaú pronto para usar. Envie primeiro o PDF do extrato e depois repita o comando."
+          );
+          return;
+        }
 
         await handleRecebimentosMessage({
-          message: msg,
+          message: lastPdf?.documentJson
+            ? buildSyntheticMessageWithDocument(msg, lastPdf?.file_name || "extrato_itau.pdf")
+            : msg,
           text,
           sendTelegramMessage,
           documentText: lastPdf?.documentText || "",
