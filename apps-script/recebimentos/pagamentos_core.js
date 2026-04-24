@@ -41,6 +41,7 @@ const PAY_GMAIL_LABEL_ERRO = "pay-erro";
 const PAY_GMAIL_LABEL_IGNORADO = "pay-ignorado";
 const PAY_GMAIL_QUERY_EXTRATO_INTER = "from:no-reply@inter.co has:attachment newer_than:180d";
 const PAY_EXTRATO_CACHE_PREFIX = "PAYINTER_EXTRATO_PARSE__";
+const PAY_INTER_EXTRATO_DRIVE_FOLDER_ID = "1oJCd0cfQeU5Z5v0UaYvI1Cjr9H7psagD";
 
 const PAY_IGNORE_NAMES = [
   "lp comercio",
@@ -463,8 +464,7 @@ function payListarNomesPlanosGC_() {
   return out;
 }
 
-function payEscolherAnexoExtratoInter_(anexos) {
-  const txts = [];
+function payEscolherAnexoPdfExtratoInter_(anexos) {
   const pdfs = [];
 
   for (let i = 0; i < (anexos || []).length; i++) {
@@ -472,26 +472,20 @@ function payEscolherAnexoExtratoInter_(anexos) {
     const mime = String(anexo.getContentType() || "").toLowerCase();
     const nome = String(anexo.getName() || "").toLowerCase();
 
-    if (mime.indexOf("text/plain") >= 0 || /\.txt$/i.test(nome)) {
-      txts.push(anexo);
-    } else if (mime === "application/pdf" || /\.pdf$/i.test(nome)) {
+    if (mime === "application/pdf" || /\.pdf$/i.test(nome)) {
       pdfs.push(anexo);
     }
   }
 
-  const escolherPreferido = function(lista) {
-    if (!lista.length) return null;
+  if (!pdfs.length) return null;
 
-    for (let j = 0; j < lista.length; j++) {
-      if (payNorm_(lista[j].getName() || "").indexOf("extrato") >= 0) {
-        return lista[j];
-      }
+  for (let j = 0; j < pdfs.length; j++) {
+    if (payNorm_(pdfs[j].getName() || "").indexOf("extrato") >= 0) {
+      return pdfs[j];
     }
+  }
 
-    return lista[0];
-  };
-
-  return escolherPreferido(txts) || escolherPreferido(pdfs) || null;
+  return pdfs[0];
 }
 
 function payPareceEmailExtratoInter_(msg, anexo) {
@@ -527,6 +521,22 @@ function payLerTextoAnexoInter_(anexo) {
     .replace(/^\uFEFF/, "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
+}
+
+function payGetBlobFromSource_(source) {
+  if (!source) {
+    throw new Error("Fonte do extrato vazia.");
+  }
+
+  if (typeof source.copyBlob === "function") {
+    return source.copyBlob();
+  }
+
+  if (typeof source.getBlob === "function") {
+    return source.getBlob();
+  }
+
+  throw new Error("Fonte do extrato sem método de blob compatível.");
 }
 
 function payExtrairPeriodoDoNomeArquivoInter_(texto) {
@@ -566,6 +576,55 @@ function payScoreCandidatoExtratoInter_(periodoArquivo, datasPermitidas, msgDate
   return (cobreTudo ? 900000000000 : 600000000000) + (cobertura * 1000000) + baseTime;
 }
 
+function payListarCandidatosExtratoInterDrive_(periodo) {
+  const datasPermitidas = payMontarJanelaDatasPorPeriodo_(periodo);
+  const out = [];
+
+  try {
+    const folder = DriveApp.getFolderById(PAY_INTER_EXTRATO_DRIVE_FOLDER_ID);
+    const files = folder.getFiles();
+
+    while (files.hasNext()) {
+      const file = files.next();
+      const nome = String(file.getName() || "");
+      const mime = String(file.getMimeType() || "").toLowerCase();
+
+      if (mime !== "application/pdf" && !/\.pdf$/i.test(nome)) continue;
+      if (payNorm_(nome).indexOf("extrato") < 0) continue;
+
+      const periodoArquivo = payExtrairPeriodoDoNomeArquivoInter_(nome);
+      const score = payScoreCandidatoExtratoInter_(
+        periodoArquivo,
+        datasPermitidas,
+        file.getLastUpdated()
+      );
+
+      if (score < 0) continue;
+
+      out.push({
+        source_kind: "drive_folder_pdf",
+        file: file,
+        attachment: file,
+        periodo_arquivo: periodoArquivo,
+        score: score,
+        message: null,
+        assunto_email: "[Drive] " + nome,
+        remetente: "Drive",
+        message_id: "drive:" + String(file.getId() || ""),
+        attachment_name: nome
+      });
+    }
+  } catch (e) {
+    Logger.log("Falha ao listar extratos do Inter na pasta do Drive: " + e);
+  }
+
+  out.sort(function(a, b) {
+    return Number(b.score || 0) - Number(a.score || 0);
+  });
+
+  return out;
+}
+
 function payListarCandidatosExtratoInter_(periodo) {
   const datasPermitidas = payMontarJanelaDatasPorPeriodo_(periodo);
   const threads = GmailApp.search(PAY_GMAIL_QUERY_EXTRATO_INTER, 0, 80);
@@ -581,12 +640,12 @@ function payListarCandidatosExtratoInter_(periodo) {
         includeAttachments: true
       }) || [];
 
-      const anexoExtrato = payEscolherAnexoExtratoInter_(anexos);
-      if (!anexoExtrato) continue;
-      if (!payPareceEmailExtratoInter_(msg, anexoExtrato)) continue;
+      const anexoPdf = payEscolherAnexoPdfExtratoInter_(anexos);
+      if (!anexoPdf) continue;
+      if (!payPareceEmailExtratoInter_(msg, anexoPdf)) continue;
 
       const periodoArquivo = payExtrairPeriodoDoNomeArquivoInter_(
-        String(anexoExtrato.getName() || "") + " " + safeSubjectInter_(msg)
+        String(anexoPdf.getName() || "") + " " + safeSubjectInter_(msg)
       );
       const score = payScoreCandidatoExtratoInter_(
         periodoArquivo,
@@ -597,10 +656,15 @@ function payListarCandidatosExtratoInter_(periodo) {
       if (score < 0) continue;
 
       out.push({
+        source_kind: "gmail_pdf",
         message: msg,
-        attachment: anexoExtrato,
+        attachment: anexoPdf,
         periodo_arquivo: periodoArquivo,
-        score: score
+        score: score,
+        assunto_email: safeSubjectInter_(msg),
+        remetente: msg.getFrom(),
+        message_id: String(msg.getId() || ""),
+        attachment_name: String(anexoPdf.getName() || "")
       });
     }
   }
@@ -662,7 +726,7 @@ function payDescreverDatasPermitidasPrompt_(datasPermitidas) {
 
 function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
   const apiKey = getScriptPropOrThrowInter_("OPENAI_API_KEY");
-  const blob = anexoPdf.copyBlob();
+  const blob = payGetBlobFromSource_(anexoPdf);
   const nomeArquivo = String(anexoPdf.getName() || "extrato_inter.pdf");
   const mime = String(blob.getContentType() || "application/pdf").toLowerCase();
   const base64 = Utilities.base64Encode(blob.getBytes());
@@ -957,13 +1021,15 @@ function payAnalisarExtratoInterTxt_(anexoTxt, datasPermitidas) {
 }
 
 function payObterPagamentosDoMelhorExtratoInter_(periodo) {
-  const candidatos = payListarCandidatosExtratoInter_(periodo);
+  const candidatosDrive = payListarCandidatosExtratoInterDrive_(periodo);
+  const candidatosGmail = payListarCandidatosExtratoInter_(periodo);
+  const candidatos = candidatosDrive.length ? candidatosDrive : candidatosGmail;
 
   if (!candidatos.length) {
     return {
       ok: false,
       encontrado: false,
-      message: "Nenhum extrato PDF do Inter encontrado no Gmail."
+      message: "Nenhum extrato PDF do Inter encontrado nem na pasta do Drive nem no Gmail."
     };
   }
 
@@ -976,16 +1042,10 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
 
   let parsed = payLerRegistroDrive_(cacheFileName);
   if (!parsed || parsed.cache_type !== "inter_pdf_pagamentos_periodo") {
-    const datasPermitidas = payMontarJanelaDatasPorPeriodo_(periodo);
-    const nomeAnexo = String(candidato.attachment.getName() || "").toLowerCase();
-    const mimeAnexo = String(candidato.attachment.getContentType() || "").toLowerCase();
-
-    if (mimeAnexo.indexOf("text/plain") >= 0 || /\.txt$/i.test(nomeAnexo)) {
-      parsed = payAnalisarExtratoInterTxt_(candidato.attachment, datasPermitidas);
-    } else {
-      parsed = payAnalisarExtratoInterPdfComOpenAI_(candidato.attachment, datasPermitidas);
-    }
-
+    parsed = payAnalisarExtratoInterPdfComOpenAI_(
+      candidato.attachment,
+      payMontarJanelaDatasPorPeriodo_(periodo)
+    );
     parsed.cache_type = "inter_pdf_pagamentos_periodo";
     parsed.cached_at = new Date().toISOString();
     payGravarRegistroNoDrive_(cacheFileName, parsed);
@@ -994,16 +1054,17 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
   return {
     ok: true,
     encontrado: true,
-    source_kind: "pdf_extrato",
-    message_id: String(candidato.message.getId() || ""),
-    assunto_email: safeSubjectInter_(candidato.message),
-    remetente: candidato.message.getFrom(),
-    attachment_name: String(candidato.attachment.getName() || ""),
+    source_kind: candidato.source_kind || "pdf_extrato",
+    message_id: String(candidato.message_id || ""),
+    assunto_email: candidato.assunto_email || "[Extrato Inter PDF]",
+    remetente: candidato.remetente || "",
+    attachment_name: candidato.attachment_name || String(candidato.attachment.getName() || ""),
     periodo_arquivo: candidato.periodo_arquivo || null,
     pagamentos: Array.isArray(parsed.pagamentos) ? parsed.pagamentos : [],
     extrato_detectado: !!parsed.extrato_detectado,
     banco: parsed.banco || "Inter",
-    observacoes: parsed.observacoes || ""
+    observacoes: parsed.observacoes || "",
+    origem_extrato: candidatosDrive.length ? "drive_folder_pdf" : "gmail_pdf"
   };
 }
 
@@ -1534,7 +1595,7 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
           remetente: extrato.remetente || "",
           message_id: extrato.message_id || "",
           attachment_name: extrato.attachment_name || "",
-          source_kind: "pdf_extrato"
+          source_kind: extrato.source_kind || "pdf_extrato"
         });
 
       } catch (e) {
@@ -1554,7 +1615,7 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
           assunto_email: extrato.assunto_email || "",
           remetente: extrato.remetente || "",
           message_id: String(extrato.message_id || ""),
-          source_kind: "pdf_extrato",
+          source_kind: extrato.source_kind || "pdf_extrato",
           attachment_name: extrato.attachment_name || "",
           status: "pendente_associacao",
           erro: String(e)
@@ -1567,7 +1628,7 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
       modo: "pre_visualizacao",
       tipo_fluxo: "pagamentos",
       origem: "inter",
-      fonte_dados: "extrato_pdf_gmail",
+      fonte_dados: extrato.origem_extrato || "extrato_pdf_gmail",
       periodo: payNormalizarPeriodoRetorno_(periodo),
       itens_prontos: itens_prontos,
       pendencias_associacao: pendencias_associacao,
@@ -1597,7 +1658,7 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
       ja_processados: [],
       message:
         (extrato && extrato.message) ||
-        "Nenhum extrato PDF do Inter nem e-mail de pagamentos encontrado para o período informado."
+        "Nenhum extrato PDF do Inter foi encontrado na pasta do Drive, no Gmail, nem houve e-mail de pagamentos no período informado."
     };
   }
 

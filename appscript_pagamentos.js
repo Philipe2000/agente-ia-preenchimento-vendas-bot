@@ -28,6 +28,12 @@ async function callPagamentosWebApp(payload) {
   console.log("Pagamentos resposta do Apps Script:");
   console.log(JSON.stringify(resp.data, null, 2));
 
+  if (typeof resp.data === "string" && /<!doctype html|<html/i.test(resp.data)) {
+    throw new Error(
+      "A URL do Apps Script de pagamentos/recebimentos no Railway está apontando para uma página HTML do Google Drive, não para a web app JSON correta."
+    );
+  }
+
   return resp.data;
 }
 
