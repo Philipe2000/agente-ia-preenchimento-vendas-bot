@@ -32,6 +32,8 @@ const pendingBatches = new Map(); // vendas
 const pendingRecebimentos = new Map(); // recebimentos
 const pendingPagamentos = new Map(); // pagamentos
 const lastPdfContextByChat = new Map();
+const activePdfProcessingByChat = new Map();
+const queuedItauCommandsByChat = new Map();
 
 /**
  * =========================================================
@@ -75,6 +77,58 @@ function getLastPdfContext(chatId) {
 
 function clearLastPdfContext(chatId) {
   lastPdfContextByChat.delete(String(chatId));
+}
+
+function markActivePdfProcessing(chatId, ctx = {}) {
+  activePdfProcessingByChat.set(String(chatId), {
+    ...ctx,
+    startedAt: new Date().toISOString()
+  });
+}
+
+function getActivePdfProcessing(chatId) {
+  return activePdfProcessingByChat.get(String(chatId)) || null;
+}
+
+function clearActivePdfProcessing(chatId) {
+  activePdfProcessingByChat.delete(String(chatId));
+}
+
+function getUsableActivePdfProcessing(chatId, maxMinutes = 5) {
+  const ctx = getActivePdfProcessing(chatId);
+  if (!ctx?.startedAt) return null;
+  const startedAt = new Date(ctx.startedAt).getTime();
+  if (!Number.isFinite(startedAt)) return null;
+  const ageMs = Date.now() - startedAt;
+  if (ageMs > maxMinutes * 60 * 1000) return null;
+  return ctx;
+}
+
+function saveQueuedItauCommand(chatId, queued) {
+  queuedItauCommandsByChat.set(String(chatId), {
+    ...queued,
+    queuedAt: new Date().toISOString()
+  });
+}
+
+function popQueuedItauCommand(chatId) {
+  const key = String(chatId);
+  const queued = queuedItauCommandsByChat.get(key) || null;
+  queuedItauCommandsByChat.delete(key);
+  return queued;
+}
+
+function shouldWaitForNewItauPdf(chatId, lastPdf = null) {
+  const active = getUsableActivePdfProcessing(chatId);
+  if (!active) return false;
+  if (!lastPdf?.savedAt) return true;
+
+  const activeStarted = new Date(active.startedAt).getTime();
+  const lastSaved = new Date(lastPdf.savedAt).getTime();
+  if (!Number.isFinite(activeStarted)) return false;
+  if (!Number.isFinite(lastSaved)) return true;
+
+  return activeStarted >= lastSaved;
 }
 
 function isFreshLastPdfContext(ctx, maxMinutes = 30) {
@@ -1179,6 +1233,62 @@ function buildSyntheticMessageWithDocument(msg, fileName = "extrato_itau.pdf") {
   };
 }
 
+async function flushQueuedItauCommandIfAny({
+  chatId,
+  sendTelegramMessage,
+  documentText = "",
+  documentJson = null,
+  fileName = ""
+}) {
+  const queued = popQueuedItauCommand(chatId);
+  if (!queued) return false;
+
+  if (!documentJson?.extrato_detectado) {
+    await sendTelegramMessage(
+      chatId,
+      "Recebi o PDF do Itaú, mas não consegui estruturar o extrato com segurança. Então não consegui continuar o comando automaticamente."
+    );
+    return true;
+  }
+
+  await sendTelegramMessage(
+    chatId,
+    "Terminei de preparar o PDF do Itaú. Vou continuar automaticamente o comando que você acabou de enviar."
+  );
+
+  const syntheticMsg = buildSyntheticMessageWithDocument(
+    queued.message,
+    fileName || queued?.message?.document?.file_name || "extrato_itau.pdf"
+  );
+
+  if (queued.kind === "pagamentos") {
+    await handlePagamentosMessage({
+      message: syntheticMsg,
+      text: queued.text,
+      transcription: queued.transcription,
+      sendTelegramMessage,
+      documentText,
+      documentJson,
+      documentFileName: fileName || "extrato_itau.pdf"
+    });
+    return true;
+  }
+
+  if (queued.kind === "recebimentos") {
+    await handleRecebimentosMessage({
+      message: syntheticMsg,
+      text: queued.text,
+      transcription: queued.transcription,
+      sendTelegramMessage,
+      documentText,
+      documentJson
+    });
+    return true;
+  }
+
+  return false;
+}
+
 async function handleRecebimentosMessage(ctx) {
   const {
     message,
@@ -1737,6 +1847,24 @@ async function handlePagamentosMessage(ctx) {
   }
 
   if (parsed.origem === "itau") {
+    const shouldWaitForPdf =
+      !documentJson && shouldWaitForNewItauPdf(chatId, lastPdf);
+
+    if (shouldWaitForPdf) {
+      saveQueuedItauCommand(chatId, {
+        kind: "pagamentos",
+        message,
+        text,
+        transcription: transcription || ""
+      });
+
+      await sendTelegramMessage(
+        chatId,
+        "Estou terminando de preparar o PDF do Itaú que você acabou de enviar. Assim que ele ficar pronto, continuo esse comando automaticamente."
+      );
+      return;
+    }
+
     const pdfCtx = documentJson
       ? {
           documentText,
@@ -2586,101 +2714,135 @@ app.post("/telegram/webhook", async (req, res) => {
         return;
       }
 
+      markActivePdfProcessing(chatId, {
+        file_name: msg.document.file_name || "",
+        message_id: msg.message_id || null
+      });
+
       const fileId = msg.document.file_id;
-      const fileInfo = await getTelegramFile(fileId);
-      const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
-
-      let documentText = "";
-      let documentJson = null;
-
-      try {
-        documentText = await extractTextFromPdfBuffer(pdfBuffer);
-      } catch (err) {
-        console.error("Falha ao extrair texto do PDF:", err?.message || err);
-      }
-
-      const itauDetected =
-        looksLikeItauStatement(documentText) || normalizeText(text).includes("itau");
-
-      if (itauDetected) {
         try {
-          documentJson = await extrairRecebimentosItauDoPdfComIA(
-            pdfBuffer,
-            msg.document.file_name || "extrato_itau.pdf"
-          );
+          const fileInfo = await getTelegramFile(fileId);
+          const pdfBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
 
-          console.log("ITAU documentJson extraido pela IA:");
-          console.log(JSON.stringify(documentJson, null, 2));
-        } catch (err) {
-          console.error("Falha ao estruturar PDF Itaú com IA:", err?.message || err);
-        }
+          let documentText = "";
+          let documentJson = null;
 
-        saveLastPdfContext(chatId, {
-          origem: "itau",
-          file_name: msg.document.file_name || "",
-          documentText,
-          documentJson
-        });
-
-        if (!explicitRecebimentosIntentInCaption && !explicitPagamentosIntentInCaption) {
-          if (documentJson?.extrato_detectado) {
-            await sendTelegramMessage(
-              chatId,
-              "Recebi o PDF do Itaú e já deixei tudo pronto. Agora me diga o período, por exemplo:\n- preencher recebimentos Itaú hoje\n- preencher pagamentos Itaú hoje\n- preencher pagamentos Itaú últimos 7 dias"
-            );
-          } else {
-            await sendTelegramMessage(
-              chatId,
-              "Recebi o PDF, mas não consegui estruturar o extrato do Itaú com segurança ainda. Tente enviar novamente ou mande outro PDF."
-            );
+          try {
+            documentText = await extractTextFromPdfBuffer(pdfBuffer);
+          } catch (err) {
+            console.error("Falha ao extrair texto do PDF:", err?.message || err);
           }
-          return;
-        }
 
-        const syntheticMsg = buildSyntheticMessageWithDocument(
-          msg,
-          msg.document.file_name || "extrato_itau.pdf"
-        );
+          const itauDetected =
+            looksLikeItauStatement(documentText) || normalizeText(text).includes("itau");
 
-        if (explicitPagamentosIntentInCaption) {
-          await handlePagamentosMessage({
-            message: syntheticMsg,
-            text,
-            sendTelegramMessage,
-            documentText,
-            documentJson,
-            documentFileName: msg.document.file_name || "extrato_itau.pdf"
-          });
-        } else {
+          if (itauDetected) {
+            saveLastPdfContext(chatId, {
+              origem: "itau",
+              file_name: msg.document.file_name || "",
+              documentText,
+              documentJson: null,
+              processing: true
+            });
+
+            try {
+              documentJson = await extrairRecebimentosItauDoPdfComIA(
+                pdfBuffer,
+                msg.document.file_name || "extrato_itau.pdf"
+              );
+
+              console.log("ITAU documentJson extraido pela IA:");
+              console.log(JSON.stringify(documentJson, null, 2));
+            } catch (err) {
+              console.error("Falha ao estruturar PDF Itaú com IA:", err?.message || err);
+            }
+
+            saveLastPdfContext(chatId, {
+              origem: "itau",
+              file_name: msg.document.file_name || "",
+              documentText,
+              documentJson,
+              processing: false
+            });
+
+            clearActivePdfProcessing(chatId);
+
+            const flushedQueuedCommand = await flushQueuedItauCommandIfAny({
+              chatId,
+              sendTelegramMessage,
+              documentText,
+              documentJson,
+              fileName: msg.document.file_name || "extrato_itau.pdf"
+            });
+
+            if (flushedQueuedCommand) {
+              return;
+            }
+
+            if (!explicitRecebimentosIntentInCaption && !explicitPagamentosIntentInCaption) {
+              if (documentJson?.extrato_detectado) {
+                await sendTelegramMessage(
+                  chatId,
+                  "Recebi o PDF do Itaú e já deixei tudo pronto. Agora me diga o período, por exemplo:\n- preencher recebimentos Itaú hoje\n- preencher pagamentos Itaú hoje\n- preencher pagamentos Itaú últimos 7 dias"
+                );
+              } else {
+                await sendTelegramMessage(
+                  chatId,
+                  "Recebi o PDF, mas não consegui estruturar o extrato do Itaú com segurança ainda. Tente enviar novamente ou mande outro PDF."
+                );
+              }
+              return;
+            }
+
+            const syntheticMsg = buildSyntheticMessageWithDocument(
+              msg,
+              msg.document.file_name || "extrato_itau.pdf"
+            );
+
+            if (explicitPagamentosIntentInCaption) {
+              await handlePagamentosMessage({
+                message: syntheticMsg,
+                text,
+                sendTelegramMessage,
+                documentText,
+                documentJson,
+                documentFileName: msg.document.file_name || "extrato_itau.pdf"
+              });
+            } else {
+              await handleRecebimentosMessage({
+                message: syntheticMsg,
+                text,
+                sendTelegramMessage,
+                documentText,
+                documentJson
+              });
+            }
+            return;
+          }
+
+          clearActivePdfProcessing(chatId);
+
+          const isReceb = explicitRecebimentosIntentInCaption || isRecebimentosIntent(text, msg);
+
+          if (!isReceb) {
+            await sendTelegramMessage(
+              chatId,
+              "Recebi um PDF. Se isso for um extrato, me diga algo como:\n- preencher recebimentos Itaú últimos 7 dias\n- preencher pagamentos Itaú hoje"
+            );
+            return;
+          }
+
           await handleRecebimentosMessage({
-            message: syntheticMsg,
+            message: msg,
             text,
             sendTelegramMessage,
             documentText,
             documentJson
           });
+          return;
+        } finally {
+          clearActivePdfProcessing(chatId);
         }
-        return;
-      }
-
-      const isReceb = explicitRecebimentosIntentInCaption || isRecebimentosIntent(text, msg);
-
-      if (!isReceb) {
-        await sendTelegramMessage(
-          chatId,
-          "Recebi um PDF. Se isso for um extrato, me diga algo como:\n- preencher recebimentos Itaú últimos 7 dias\n- preencher pagamentos Itaú hoje"
-        );
-        return;
-      }
-
-      await handleRecebimentosMessage({
-        message: msg,
-        text,
-        sendTelegramMessage,
-        documentText,
-        documentJson
-      });
-      return;
     }
 
     // =====================================================
@@ -2728,6 +2890,21 @@ app.post("/telegram/webhook", async (req, res) => {
             : msg,
           documentText: lastPdf?.documentText || ""
         });
+
+        if (origemFromContext === "itau" && shouldWaitForNewItauPdf(chatId, lastPdf)) {
+          saveQueuedItauCommand(chatId, {
+            kind: "recebimentos",
+            message: msg,
+            text: transcription,
+            transcription
+          });
+
+          await sendTelegramMessage(
+            chatId,
+            "Estou terminando de preparar o PDF do Itaú que você acabou de enviar. Assim que ele ficar pronto, continuo esse comando automaticamente."
+          );
+          return;
+        }
 
         if (origemFromContext === "itau" && !lastPdf?.documentJson) {
           await sendTelegramMessage(
@@ -2799,6 +2976,20 @@ app.post("/telegram/webhook", async (req, res) => {
             : msg,
           documentText: lastPdf?.documentText || ""
         });
+
+        if (origemFromContext === "itau" && shouldWaitForNewItauPdf(chatId, lastPdf)) {
+          saveQueuedItauCommand(chatId, {
+            kind: "recebimentos",
+            message: msg,
+            text
+          });
+
+          await sendTelegramMessage(
+            chatId,
+            "Estou terminando de preparar o PDF do Itaú que você acabou de enviar. Assim que ele ficar pronto, continuo esse comando automaticamente."
+          );
+          return;
+        }
 
         if (origemFromContext === "itau" && !lastPdf?.documentJson) {
           await sendTelegramMessage(
