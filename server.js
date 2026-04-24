@@ -6,7 +6,12 @@ const {
   isRecebimentosIntent,
   parseRecebimentosIntent
 } = require("./intents_recebimentos");
+const {
+  isPagamentosIntent,
+  parsePagamentosIntent
+} = require("./intents_pagamentos");
 const { callRecebimentosWebApp } = require("./appscript_recebimentos");
+const { callPagamentosWebApp } = require("./appscript_pagamentos");
 const { callVendasWebApp } = require("./appscript_vendas");
 
 const app = express();
@@ -25,6 +30,7 @@ const OPENAI_TRANSCRIBE_MODEL =
  */
 const pendingBatches = new Map(); // vendas
 const pendingRecebimentos = new Map(); // recebimentos
+const pendingPagamentos = new Map(); // pagamentos
 const lastPdfContextByChat = new Map();
 
 /**
@@ -42,6 +48,18 @@ function getPendingRecebimentos(chatId) {
 
 function clearPendingRecebimentos(chatId) {
   pendingRecebimentos.delete(String(chatId));
+}
+
+function savePendingPagamentos(chatId, lote) {
+  pendingPagamentos.set(String(chatId), lote);
+}
+
+function getPendingPagamentos(chatId) {
+  return pendingPagamentos.get(String(chatId)) || null;
+}
+
+function clearPendingPagamentos(chatId) {
+  pendingPagamentos.delete(String(chatId));
 }
 
 function saveLastPdfContext(chatId, ctx) {
@@ -1139,6 +1157,504 @@ async function handleRecebimentosMessage(ctx) {
 
 /**
  * =========================================================
+ * PAGAMENTOS - HELPERS
+ * =========================================================
+ */
+function limparPlanoContasFalado(text) {
+  return String(text || "")
+    .trim()
+    .replace(/^[\s"'`.,;:!?-]+/, "")
+    .replace(/[\s"'`.,;:!?-]+$/, "")
+    .replace(/^(o|a|plano|plano de contas)\s+/i, "")
+    .trim();
+}
+
+async function resolvePlanoContasViaAppsScript(nomeFalado) {
+  try {
+    const resp = await callPagamentosWebApp({
+      action: "resolver_plano_pagamentos",
+      nome_falado: nomeFalado
+    });
+
+    return resp;
+  } catch (err) {
+    console.error("Erro ao resolver plano via Apps Script:", err?.message || err);
+    return {
+      ok: false,
+      encontrado: false,
+      plano_contas: "",
+      message: String(err?.message || err || "Falha ao consultar Apps Script")
+    };
+  }
+}
+
+function parseAssociarPagamentoCommand(text, lote = null) {
+  const raw = String(text || "").trim();
+
+  let m = raw.match(/^associar\s+(P\d+)\s+(.+)$/i);
+  if (m) {
+    return {
+      pendenciaId: String(m[1]).toUpperCase(),
+      planoContas: limparPlanoContasFalado(m[2])
+    };
+  }
+
+  m = raw.match(/^associar\s+(.+?)\s+(?:a|ao)\s+(.+)$/i);
+  if (m && lote) {
+    const nomeFalado = normalizeText(m[1]);
+    const planoContas = limparPlanoContasFalado(m[2]);
+
+    const pendencias = Array.isArray(lote?.pendencias_associacao)
+      ? lote.pendencias_associacao
+      : [];
+
+    const found = pendencias.find((p) => {
+      const nomeExtraido = normalizeText(
+        p.nome_extraido || p.descricao_extraida || ""
+      );
+      return nomeExtraido.includes(nomeFalado) || nomeFalado.includes(nomeExtraido);
+    });
+
+    if (found) {
+      return {
+        pendenciaId: String(found.id_local).toUpperCase(),
+        planoContas
+      };
+    }
+  }
+
+  return null;
+}
+
+function summarizePendingPagamentos(lote) {
+  const prontos = Array.isArray(lote?.itens_prontos) ? lote.itens_prontos : [];
+  const pendencias = Array.isArray(lote?.pendencias_associacao)
+    ? lote.pendencias_associacao
+    : [];
+  const ignorados = Array.isArray(lote?.ignorados) ? lote.ignorados : [];
+  const duplicados = Array.isArray(lote?.duplicados) ? lote.duplicados : [];
+  const jaProcessados = Array.isArray(lote?.ja_processados)
+    ? lote.ja_processados
+    : [];
+
+  const linhas = [];
+  linhas.push(`Pagamentos ${String(lote?.origem || "").toUpperCase()} encontrados.`);
+  linhas.push("");
+  linhas.push(`Período: ${lote?.periodo?.label || "não informado"}`);
+  linhas.push(`Prontos para preencher: ${prontos.length}`);
+  linhas.push(`Pendências: ${pendencias.length}`);
+  linhas.push(`Ignorados: ${ignorados.length}`);
+  linhas.push(`Já processados: ${jaProcessados.length}`);
+  linhas.push(`Duplicados: ${duplicados.length}`);
+
+  if (prontos.length) {
+    linhas.push("", "Prontos:");
+    prontos.forEach((item, idx) => {
+      let extra = "";
+      if (item.force_duplicate) extra = " | duplicata liberada";
+      linhas.push(
+        `${idx + 1}. ${item.plano_contas} | ${item.data_pagamento} | ${formatMoneyBRL(item.valor)}${extra}`
+      );
+    });
+  }
+
+  if (pendencias.length) {
+    linhas.push("", "Pendências:");
+    pendencias.forEach((item) => {
+      let extra = "";
+      if (item.gc_ambiguo) extra = " | GC ambíguo";
+      else if (item.erro) extra = ` | ${item.erro}`;
+
+      linhas.push(
+        `${item.id_local}. ${item.nome_extraido || item.descricao_extraida || "?"} | ${item.data_pagamento || "?"} | ${formatMoneyBRL(item.valor)}${extra}`
+      );
+    });
+  }
+
+  if (duplicados.length) {
+    linhas.push("", "Duplicados:");
+    duplicados.forEach((item) => {
+      const motivo = String(item.motivo || "");
+      let origemDup = "duplicado";
+
+      if (motivo === "duplicado_gc") origemDup = "GC";
+      else if (motivo === "duplicado_drive_log") origemDup = "Drive log";
+
+      const plano = item.plano_contas || item.nome_extraido || "?";
+      const data = item.data_pagamento || "?";
+      const valor = formatMoneyBRL(item.valor);
+
+      let extra = "";
+      if (item.gc_pagamento_codigo || item.gc_pagamento_id) {
+        extra =
+          " | cód " + (item.gc_pagamento_codigo || "?") +
+          " | id " + (item.gc_pagamento_id || "?");
+      }
+
+      linhas.push(
+        `${item.id_local}. ${origemDup} | ${plano} | ${data} | ${valor}${extra}`
+      );
+    });
+  }
+
+  linhas.push("", "Comandos:");
+  linhas.push("- associar P1 NOME_DO_PLANO_DE_CONTAS");
+  linhas.push("- ou: associar NOME_DA_PENDENCIA a NOME_DO_PLANO_DE_CONTAS");
+  linhas.push("- liberar duplicata D1");
+  linhas.push("- remover 1");
+  linhas.push("- confirmar lote");
+  linhas.push("- cancelar lote");
+  linhas.push("");
+  linhas.push("Exemplos:");
+  linhas.push("- associar P1 Salario Philipe");
+  linhas.push("- associar Mercado X a Compras Diversas");
+  linhas.push("- liberar duplicata D1");
+
+  return linhas.join("\n");
+}
+
+function buildForcedPagamentoFromDuplicate(lote, duplicado) {
+  return {
+    id_local: `I${(lote.itens_prontos?.length || 0) + 1}`,
+    plano_contas: duplicado.plano_contas || duplicado.nome_extraido || "",
+    descricao_pagamento:
+      duplicado.plano_contas || duplicado.descricao_extraida || duplicado.nome_extraido || "",
+    nome_extraido: duplicado.nome_extraido || "",
+    descricao_extraida: duplicado.descricao_extraida || "",
+    data_pagamento: duplicado.data_pagamento || "",
+    data_compensacao: duplicado.data_pagamento || "",
+    vencimento: duplicado.data_pagamento || "",
+    valor: duplicado.valor,
+    forma: "PIX",
+    conta_oficial: lote.origem === "itau" ? "Itaú Empresas" : "Inter Empresas",
+    quitado: "Sim",
+    banco_extraido: duplicado.banco_extraido || "",
+    cpf_cnpj: duplicado.cpf_cnpj || "",
+    id_transacao: duplicado.id_transacao || null,
+    assunto_email: duplicado.assunto_email || "",
+    remetente: duplicado.remetente || "",
+    message_id: duplicado.message_id || "",
+    status: "pronto",
+    force_duplicate: true,
+    duplicate_source: duplicado.motivo || "duplicado_gc",
+    duplicate_reference: {
+      gc_pagamento_id: duplicado.gc_pagamento_id || null,
+      gc_pagamento_codigo: duplicado.gc_pagamento_codigo || null
+    }
+  };
+}
+
+async function tryHandlePagamentosPendingCommands(chatId, text) {
+  const lote = getPendingPagamentos(chatId);
+  if (!lote) return false;
+
+  if (hasMultipleAssociations(text)) {
+    await sendTelegramMessage(
+      chatId,
+      "Faça uma associação por vez. Exemplo: associar Mercado X a Compras Diversas"
+    );
+    return true;
+  }
+
+  const liberarDuplicata = parseLiberarDuplicataCommand(text);
+  if (liberarDuplicata) {
+    const duplicados = Array.isArray(lote.duplicados) ? lote.duplicados : [];
+    const idx = duplicados.findIndex(
+      (d) => String(d.id_local || "").toUpperCase() === liberarDuplicata.duplicataId
+    );
+
+    if (idx < 0) {
+      await sendTelegramMessage(chatId, `Não encontrei a duplicata ${liberarDuplicata.duplicataId}.`);
+      return true;
+    }
+
+    const duplicado = duplicados[idx];
+    const itemPronto = buildForcedPagamentoFromDuplicate(lote, duplicado);
+
+    lote.duplicados.splice(idx, 1);
+    lote.itens_prontos.push(itemPronto);
+    lote.historico_comandos.push({
+      tipo: "liberacao_duplicata",
+      duplicata_id: liberarDuplicata.duplicataId,
+      plano_contas: itemPronto.plano_contas,
+      em: new Date().toISOString()
+    });
+
+    savePendingPagamentos(chatId, lote);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        "Duplicata liberada manualmente:",
+        `${liberarDuplicata.duplicataId} -> ${itemPronto.plano_contas} | ${itemPronto.data_pagamento} | ${formatMoneyBRL(itemPronto.valor)}`,
+        "",
+        summarizePendingPagamentos(lote)
+      ].join("\n")
+    );
+    return true;
+  }
+
+  const associar = parseAssociarPagamentoCommand(text, lote);
+  if (associar) {
+    if (!associar.planoContas) {
+      await sendTelegramMessage(chatId, "Não consegui identificar o plano de contas.");
+      return true;
+    }
+
+    const resolved = await resolvePlanoContasViaAppsScript(associar.planoContas);
+
+    if (resolved?.ok && resolved?.encontrado && resolved?.plano_contas) {
+      associar.planoContas = resolved.plano_contas;
+    }
+
+    const pendencias = Array.isArray(lote?.pendencias_associacao)
+      ? lote.pendencias_associacao
+      : [];
+    const idx = pendencias.findIndex(
+      (p) => String(p.id_local || "").toUpperCase() === associar.pendenciaId
+    );
+
+    if (idx < 0) {
+      await sendTelegramMessage(chatId, `Não encontrei a pendência ${associar.pendenciaId}.`);
+      return true;
+    }
+
+    const pendencia = pendencias[idx];
+    const payload = {
+      action: "associar_pendencia_pagamentos",
+      origem: lote.origem,
+      pendencia_id: pendencia.id_local,
+      nome_extraido: pendencia.nome_extraido || pendencia.descricao_extraida || "",
+      plano_contas: associar.planoContas
+    };
+
+    let result = await callPagamentosWebApp(payload);
+    console.log("Pagamentos associar result:", JSON.stringify(result));
+
+    if (!result?.ok) {
+      const secondTry = await resolvePlanoContasViaAppsScript(
+        limparPlanoContasFalado(associar.planoContas)
+      );
+
+      if (secondTry?.ok && secondTry?.encontrado && secondTry?.plano_contas) {
+        payload.plano_contas = secondTry.plano_contas;
+        associar.planoContas = secondTry.plano_contas;
+        result = await callPagamentosWebApp(payload);
+        console.log("Pagamentos associar retry result:", JSON.stringify(result));
+      }
+    }
+
+    if (!result?.ok) {
+      await sendTelegramMessage(
+        chatId,
+        result?.message || "Não consegui salvar a associação."
+      );
+      return true;
+    }
+
+    const itemPronto = {
+      id_local: `I${(lote.itens_prontos?.length || 0) + 1}`,
+      plano_contas: associar.planoContas,
+      descricao_pagamento: associar.planoContas,
+      nome_extraido: pendencia.nome_extraido || "",
+      descricao_extraida: pendencia.descricao_extraida || "",
+      data_pagamento: pendencia.data_pagamento,
+      data_compensacao: pendencia.data_compensacao || pendencia.data_pagamento,
+      vencimento: pendencia.vencimento || pendencia.data_pagamento,
+      valor: pendencia.valor,
+      forma: pendencia.forma || "PIX",
+      conta_oficial: pendencia.conta_oficial || "Inter Empresas",
+      quitado: "Sim",
+      banco_extraido: pendencia.banco_extraido || "",
+      cpf_cnpj: pendencia.cpf_cnpj || "",
+      id_transacao: pendencia.id_transacao || null,
+      assunto_email: pendencia.assunto_email || "",
+      remetente: pendencia.remetente || "",
+      message_id: pendencia.message_id || "",
+      status: "pronto"
+    };
+
+    lote.pendencias_associacao.splice(idx, 1);
+    lote.itens_prontos.push(itemPronto);
+    lote.historico_comandos.push({
+      tipo: "associacao",
+      pendencia_id: associar.pendenciaId,
+      plano_contas: associar.planoContas,
+      em: new Date().toISOString()
+    });
+
+    savePendingPagamentos(chatId, lote);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        "Associação salva:",
+        `${pendencia.nome_extraido || pendencia.descricao_extraida || "pendência"} -> ${associar.planoContas}`,
+        "",
+        summarizePendingPagamentos(lote)
+      ].join("\n")
+    );
+    return true;
+  }
+
+  const remover = parseRemoverRecebimentoCommand(text);
+  if (remover) {
+    const idx = remover.itemNumero - 1;
+    const prontos = Array.isArray(lote.itens_prontos) ? lote.itens_prontos : [];
+
+    if (idx < 0 || idx >= prontos.length) {
+      await sendTelegramMessage(chatId, `Não encontrei o item ${remover.itemNumero}.`);
+      return true;
+    }
+
+    const removido = prontos.splice(idx, 1)[0];
+    lote.historico_comandos.push({
+      tipo: "remocao",
+      item_numero: remover.itemNumero,
+      plano_contas: removido?.plano_contas || "",
+      em: new Date().toISOString()
+    });
+
+    savePendingPagamentos(chatId, lote);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        "Item removido do lote:",
+        `${remover.itemNumero}. ${removido.plano_contas} | ${removido.data_pagamento} | ${formatMoneyBRL(removido.valor)}`,
+        "",
+        summarizePendingPagamentos(lote)
+      ].join("\n")
+    );
+    return true;
+  }
+
+  if (isCancelarRecebimentosCommand(text)) {
+    clearPendingPagamentos(chatId);
+    await sendTelegramMessage(chatId, "Lote de pagamentos cancelado.");
+    return true;
+  }
+
+  if (isConfirmarRecebimentosCommand(text)) {
+    if ((lote.pendencias_associacao || []).length > 0) {
+      await sendTelegramMessage(
+        chatId,
+        "Ainda existem pendências de associação. Resolva antes de confirmar o lote."
+      );
+      return true;
+    }
+
+    const payload = {
+      action: "confirmar_lote_pagamentos",
+      origem: lote.origem,
+      itens: lote.itens_prontos || []
+    };
+
+    const result = await callPagamentosWebApp(payload);
+    console.log("Pagamentos confirmar result:", JSON.stringify(result));
+
+    if (!result?.ok) {
+      await sendTelegramMessage(
+        chatId,
+        result?.message || "Não consegui confirmar o lote de pagamentos."
+      );
+      return true;
+    }
+
+    clearPendingPagamentos(chatId);
+    await sendTelegramMessage(chatId, result?.message || "Lote confirmado com sucesso.");
+    return true;
+  }
+
+  return false;
+}
+
+async function handlePagamentosMessage(ctx) {
+  const { message, text, sendTelegramMessage, transcription } = ctx;
+  const chatId = message.chat.id;
+  const parsed = parsePagamentosIntent(text, message);
+
+  if (transcription) {
+    await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
+  }
+
+  if (parsed.origem === "itau") {
+    await sendTelegramMessage(
+      chatId,
+      "Pagamentos Itaú ainda não estão implementados nesta primeira fase. Vou seguir primeiro com pagamentos do Inter."
+    );
+    return;
+  }
+
+  await sendTelegramMessage(
+    chatId,
+    `Entendi. Vou processar pagamentos de ${parsed.origem.toUpperCase()} para ${parsed.periodo.label}.`
+  );
+
+  await sendTelegramMessage(
+    chatId,
+    "Montando a prévia dos pagamentos, aguarde um instante..."
+  );
+
+  const result = await callPagamentosWebApp({
+    action: "processar_pagamentos_v1",
+    origem: parsed.origem,
+    periodo: parsed.periodo,
+    telegram: {
+      chat_id: chatId
+    },
+    message_meta: {
+      message_id: message.message_id || null,
+      date: message.date || null
+    }
+  });
+
+  console.log("Pagamentos result:", JSON.stringify(result));
+
+  if (result?.modo === "pre_visualizacao") {
+    const duplicadosComId = (result.duplicados || []).map((d, idx) => ({
+      ...d,
+      id_local: `D${idx + 1}`
+    }));
+
+    const lote = {
+      tipo: "pagamentos_lote_pendente",
+      origem: result.origem || parsed.origem,
+      periodo: result.periodo || parsed.periodo,
+      criadoEm: new Date().toISOString(),
+      resumoOrigem: {
+        processados_detectados: (result.itens_prontos || []).length,
+        ignorados: (result.ignorados || []).length,
+        duplicados: duplicadosComId.length,
+        ja_processados: (result.ja_processados || []).length,
+        erros: (result.pendencias_associacao || []).length
+      },
+      itens_prontos: result.itens_prontos || [],
+      pendencias_associacao: result.pendencias_associacao || [],
+      ignorados: result.ignorados || [],
+      duplicados: duplicadosComId,
+      ja_processados: result.ja_processados || [],
+      historico_comandos: []
+    };
+
+    savePendingPagamentos(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingPagamentos(lote));
+    return;
+  }
+
+  if (!result?.ok && result?.modo !== "pre_visualizacao") {
+    await sendTelegramMessage(
+      chatId,
+      result?.message || result?.error || "Não consegui processar os pagamentos."
+    );
+    return;
+  }
+
+  await sendTelegramMessage(chatId, result?.message || "Pagamentos processados.");
+}
+
+/**
+ * =========================================================
  * VENDAS - CÓDIGO ATUAL
  * =========================================================
  */
@@ -1924,6 +2440,9 @@ app.post("/telegram/webhook", async (req, res) => {
       const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, transcription);
       if (handledRecebimentosPending) return;
 
+      const handledPagamentosPending = await tryHandlePagamentosPendingCommands(chatId, transcription);
+      if (handledPagamentosPending) return;
+
       if (isRecebimentosIntent(transcription, msg)) {
         const lastPdf = getUsableLastPdfContext(chatId);
 
@@ -1956,6 +2475,16 @@ app.post("/telegram/webhook", async (req, res) => {
         return;
       }
 
+      if (isPagamentosIntent(transcription, msg)) {
+        await handlePagamentosMessage({
+          message: msg,
+          text: transcription,
+          transcription,
+          sendTelegramMessage
+        });
+        return;
+      }
+
       const handledSalesPending = await tryHandlePendingSalesCommands(chatId, transcription);
       if (handledSalesPending) return;
 
@@ -1982,6 +2511,9 @@ app.post("/telegram/webhook", async (req, res) => {
     if (text) {
       const handledRecebimentosPending = await tryHandleRecebimentosPendingCommands(chatId, text);
       if (handledRecebimentosPending) return;
+
+      const handledPagamentosPending = await tryHandlePagamentosPendingCommands(chatId, text);
+      if (handledPagamentosPending) return;
 
       if (isRecebimentosIntent(text, msg)) {
         const lastPdf = getUsableLastPdfContext(chatId);
@@ -2010,6 +2542,15 @@ app.post("/telegram/webhook", async (req, res) => {
           sendTelegramMessage,
           documentText: lastPdf?.documentText || "",
           documentJson: lastPdf?.documentJson || null
+        });
+        return;
+      }
+
+      if (isPagamentosIntent(text, msg)) {
+        await handlePagamentosMessage({
+          message: msg,
+          text,
+          sendTelegramMessage
         });
         return;
       }
