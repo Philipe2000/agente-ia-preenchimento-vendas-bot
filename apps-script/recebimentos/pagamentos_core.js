@@ -39,8 +39,8 @@ const PAY_GMAIL_LABEL_PROCESSADO = "pay-processado";
 const PAY_GMAIL_LABEL_DUPLICADO = "pay-duplicado";
 const PAY_GMAIL_LABEL_ERRO = "pay-erro";
 const PAY_GMAIL_LABEL_IGNORADO = "pay-ignorado";
-const PAY_GMAIL_QUERY_EXTRATO_INTER = "from:no-reply@inter.co has:attachment filename:pdf newer_than:180d";
-const PAY_PDF_CACHE_PREFIX = "PAYINTER_PDF_PARSE__";
+const PAY_GMAIL_QUERY_EXTRATO_INTER = "from:no-reply@inter.co has:attachment newer_than:180d";
+const PAY_EXTRATO_CACHE_PREFIX = "PAYINTER_EXTRATO_PARSE__";
 
 const PAY_IGNORE_NAMES = [
   "lp comercio",
@@ -463,7 +463,8 @@ function payListarNomesPlanosGC_() {
   return out;
 }
 
-function payEscolherAnexoPdfExtratoInter_(anexos) {
+function payEscolherAnexoExtratoInter_(anexos) {
+  const txts = [];
   const pdfs = [];
 
   for (let i = 0; i < (anexos || []).length; i++) {
@@ -471,20 +472,26 @@ function payEscolherAnexoPdfExtratoInter_(anexos) {
     const mime = String(anexo.getContentType() || "").toLowerCase();
     const nome = String(anexo.getName() || "").toLowerCase();
 
-    if (mime === "application/pdf" || /\.pdf$/i.test(nome)) {
+    if (mime.indexOf("text/plain") >= 0 || /\.txt$/i.test(nome)) {
+      txts.push(anexo);
+    } else if (mime === "application/pdf" || /\.pdf$/i.test(nome)) {
       pdfs.push(anexo);
     }
   }
 
-  if (!pdfs.length) return null;
+  const escolherPreferido = function(lista) {
+    if (!lista.length) return null;
 
-  for (let j = 0; j < pdfs.length; j++) {
-    if (payNorm_(pdfs[j].getName() || "").indexOf("extrato") >= 0) {
-      return pdfs[j];
+    for (let j = 0; j < lista.length; j++) {
+      if (payNorm_(lista[j].getName() || "").indexOf("extrato") >= 0) {
+        return lista[j];
+      }
     }
-  }
 
-  return pdfs[0];
+    return lista[0];
+  };
+
+  return escolherPreferido(txts) || escolherPreferido(pdfs) || null;
 }
 
 function payPareceEmailExtratoInter_(msg, anexo) {
@@ -500,6 +507,26 @@ function payPareceEmailExtratoInter_(msg, anexo) {
     texto.indexOf("saldo disponivel") >= 0 ||
     texto.indexOf("periodo") >= 0
   );
+}
+
+function payLerTextoAnexoInter_(anexo) {
+  const blob = anexo.copyBlob();
+  let texto = "";
+
+  try {
+    texto = blob.getDataAsString("UTF-8");
+  } catch (e) {}
+
+  if (!texto || texto.indexOf("\uFFFD") >= 0) {
+    try {
+      texto = blob.getDataAsString("ISO-8859-1");
+    } catch (e) {}
+  }
+
+  return String(texto || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
 }
 
 function payExtrairPeriodoDoNomeArquivoInter_(texto) {
@@ -554,12 +581,12 @@ function payListarCandidatosExtratoInter_(periodo) {
         includeAttachments: true
       }) || [];
 
-      const anexoPdf = payEscolherAnexoPdfExtratoInter_(anexos);
-      if (!anexoPdf) continue;
-      if (!payPareceEmailExtratoInter_(msg, anexoPdf)) continue;
+      const anexoExtrato = payEscolherAnexoExtratoInter_(anexos);
+      if (!anexoExtrato) continue;
+      if (!payPareceEmailExtratoInter_(msg, anexoExtrato)) continue;
 
       const periodoArquivo = payExtrairPeriodoDoNomeArquivoInter_(
-        String(anexoPdf.getName() || "") + " " + safeSubjectInter_(msg)
+        String(anexoExtrato.getName() || "") + " " + safeSubjectInter_(msg)
       );
       const score = payScoreCandidatoExtratoInter_(
         periodoArquivo,
@@ -571,7 +598,7 @@ function payListarCandidatosExtratoInter_(periodo) {
 
       out.push({
         message: msg,
-        attachment: anexoPdf,
+        attachment: anexoExtrato,
         periodo_arquivo: periodoArquivo,
         score: score
       });
@@ -610,7 +637,7 @@ function payBuildPdfExtratoCacheFileName_(msg, anexo, periodo) {
     ].join("__")
   );
 
-  return PAY_PDF_CACHE_PREFIX + sanitizeFileNameInter_(chave) + ".json";
+  return PAY_EXTRATO_CACHE_PREFIX + sanitizeFileNameInter_(chave) + ".json";
 }
 
 function payDescreverDatasPermitidasPrompt_(datasPermitidas) {
@@ -803,6 +830,132 @@ function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
   return out;
 }
 
+function payValorCentavosExtratoTxt_(texto) {
+  const digitos = String(texto || "").replace(/\D/g, "");
+  if (!digitos) return null;
+
+  const inteiro = Number(digitos);
+  if (!isFinite(inteiro)) return null;
+  return Number((inteiro / 100).toFixed(2));
+}
+
+function payTipoLinhaExtratoTxt_(linha) {
+  const labels = [
+    { label: "EST COMPRA CARTAO", tipo: "estorno_compra" },
+    { label: "COMPRA CARTAO", tipo: "debito_compra" },
+    { label: "PIX ENVIADO", tipo: "pix_enviado" },
+    { label: "PIX RECEBIDO", tipo: "pix_recebido" }
+  ];
+
+  for (let i = 0; i < labels.length; i++) {
+    const idx = linha.indexOf(labels[i].label);
+    if (idx >= 0) {
+      return {
+        label: labels[i].label,
+        tipo: labels[i].tipo,
+        index: idx
+      };
+    }
+  }
+
+  return null;
+}
+
+function payDataLinhaExtratoTxt_(linha) {
+  const m = String(linha || "").match(/S(\d{2})(\d{2})(\d{4})(\d{2})(\d{2})(\d{4})/);
+  if (!m) return null;
+  return [m[3], m[2], m[1]].join("-");
+}
+
+function payDescricaoTipoTxt_(tipo) {
+  if (tipo === "debito_compra") return "Compra no débito";
+  if (tipo === "pix_enviado") return "Pix enviado";
+  if (tipo === "pix_recebido") return "Pix recebido";
+  if (tipo === "estorno_compra") return "Estorno compra cartão";
+  return String(tipo || "").trim();
+}
+
+function payAnalisarExtratoInterTxt_(anexoTxt, datasPermitidas) {
+  const texto = payLerTextoAnexoInter_(anexoTxt);
+  const linhas = texto.split("\n");
+  const pagamentosBrutos = [];
+  const estornos = {};
+
+  for (let i = 0; i < linhas.length; i++) {
+    const linha = String(linhas[i] || "").replace(/\u0000/g, "").trim();
+    if (!linha || linha.indexOf("DPV00") < 0) continue;
+
+    const tipoInfo = payTipoLinhaExtratoTxt_(linha);
+    if (!tipoInfo) continue;
+
+    const dataPagamento = payDataLinhaExtratoTxt_(linha);
+    if (!dataPagamento || !datasPermitidas[dataPagamento]) continue;
+
+    const prefixo = linha.slice(0, tipoInfo.index);
+    const valorMatch = prefixo.match(/(\d{4,18})([DC])(\d{7})\s*$/);
+    if (!valorMatch) continue;
+
+    const valor = payValorCentavosExtratoTxt_(valorMatch[1]);
+    const dc = valorMatch[2];
+    const sufixo = linha.slice(tipoInfo.index + tipoInfo.label.length).trim();
+    const idTransacao = String((sufixo.split(/\s+/)[0] || "")).trim();
+
+    if (valor == null || !isFinite(valor) || valor <= 0) continue;
+
+    if (tipoInfo.tipo === "pix_recebido") continue;
+
+    if (tipoInfo.tipo === "estorno_compra") {
+      const chaveEstorno = [
+        "debito_compra",
+        dataPagamento,
+        payFormatValorChave_(valor)
+      ].join("__");
+      estornos[chaveEstorno] = Number(estornos[chaveEstorno] || 0) + 1;
+      continue;
+    }
+
+    if (dc !== "D") continue;
+
+    pagamentosBrutos.push({
+      tipo_pagamento: tipoInfo.tipo,
+      data_pagamento: dataPagamento,
+      nome_favorecido: "",
+      descricao_pagamento: payDescricaoTipoTxt_(tipoInfo.tipo),
+      cpf_cnpj: null,
+      valor: valor,
+      id_transacao: idTransacao || null,
+      linha_resumo: (tipoInfo.label + (sufixo ? " " + sufixo : "")).trim()
+    });
+  }
+
+  const pagamentos = [];
+  for (let j = 0; j < pagamentosBrutos.length; j++) {
+    const item = pagamentosBrutos[j];
+    const chave = [
+      item.tipo_pagamento,
+      item.data_pagamento,
+      payFormatValorChave_(item.valor)
+    ].join("__");
+
+    if (item.tipo_pagamento === "debito_compra" && Number(estornos[chave] || 0) > 0) {
+      estornos[chave] -= 1;
+      continue;
+    }
+
+    pagamentos.push(item);
+  }
+
+  return {
+    extrato_detectado:
+      texto.indexOf("BANCO INTER S.A.") >= 0 || texto.indexOf("BANCO INTER S A") >= 0,
+    banco: "Inter",
+    periodo_inicial: null,
+    periodo_final: null,
+    pagamentos: pagamentos,
+    observacoes: "Extrato Inter TXT analisado por parser determinístico."
+  };
+}
+
 function payObterPagamentosDoMelhorExtratoInter_(periodo) {
   const candidatos = payListarCandidatosExtratoInter_(periodo);
 
@@ -823,10 +976,16 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
 
   let parsed = payLerRegistroDrive_(cacheFileName);
   if (!parsed || parsed.cache_type !== "inter_pdf_pagamentos_periodo") {
-    parsed = payAnalisarExtratoInterPdfComOpenAI_(
-      candidato.attachment,
-      payMontarJanelaDatasPorPeriodo_(periodo)
-    );
+    const datasPermitidas = payMontarJanelaDatasPorPeriodo_(periodo);
+    const nomeAnexo = String(candidato.attachment.getName() || "").toLowerCase();
+    const mimeAnexo = String(candidato.attachment.getContentType() || "").toLowerCase();
+
+    if (mimeAnexo.indexOf("text/plain") >= 0 || /\.txt$/i.test(nomeAnexo)) {
+      parsed = payAnalisarExtratoInterTxt_(candidato.attachment, datasPermitidas);
+    } else {
+      parsed = payAnalisarExtratoInterPdfComOpenAI_(candidato.attachment, datasPermitidas);
+    }
+
     parsed.cache_type = "inter_pdf_pagamentos_periodo";
     parsed.cached_at = new Date().toISOString();
     payGravarRegistroNoDrive_(cacheFileName, parsed);
@@ -2447,7 +2606,22 @@ function payMontarResumoConfirmacao_(
 function payMelhorTextoBuscaPlano_(pagamento) {
   const nome = String(pagamento.nome_favorecido || "").trim();
   const descricao = String(pagamento.descricao_pagamento || "").trim();
-  return nome || descricao;
+  const texto = nome || descricao;
+  const textoNorm = payNorm_(texto);
+
+  if (
+    [
+      "compra cartao",
+      "compra no debito",
+      "pix enviado",
+      "pix recebido",
+      "estorno compra cartao"
+    ].indexOf(textoNorm) >= 0
+  ) {
+    return "";
+  }
+
+  return texto;
 }
 
 function payLimparNomePagamento_(nome) {

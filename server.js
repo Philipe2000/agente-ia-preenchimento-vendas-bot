@@ -773,6 +773,20 @@ function summarizePendingRecebimentos(lote) {
     });
   }
 
+  if (ignorados.length) {
+    linhas.push("", "Ignorados:");
+    ignorados.slice(0, 8).forEach((item, idx) => {
+      const nome = item.nome_extraido || item.descricao_extraida || "?";
+      const data = item.data_pagamento || "?";
+      const valor = formatMoneyBRL(item.valor);
+      const motivo = item.motivo || "ignorado";
+      linhas.push(`${idx + 1}. ${nome} | ${data} | ${valor} | ${motivo}`);
+    });
+    if (ignorados.length > 8) {
+      linhas.push(`... e mais ${ignorados.length - 8} ignorado(s)`);
+    }
+  }
+
   linhas.push("", "Comandos:");
   linhas.push("- associar P1 NOME_DO_CLIENTE_OFICIAL");
   linhas.push("- ou: associar NOME_DA_PENDENCIA a NOME_DO_CLIENTE_OFICIAL");
