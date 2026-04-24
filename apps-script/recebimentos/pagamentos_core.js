@@ -2646,9 +2646,27 @@ function payExisteDuplicataGCPagamento_(planoContas, pagamento, contaOficial) {
 
 function payGetPrimeiroBlocoLivre_(sh) {
   for (let r = PAY_ROW_START; r <= PAY_ROW_END; r += PAY_STEP) {
-    const vals = sh.getRange(r, 4, 3, 6).getDisplayValues();
-    const flat = [].concat(vals[0], vals[1], vals[2]).join(" ").trim();
-    if (!flat) return { baseRow: r };
+    const campos = [
+      "D" + r,
+      "G" + r,
+      "I" + r,
+      "D" + (r + 1),
+      "G" + (r + 1),
+      "I" + (r + 1),
+      "D" + (r + 2),
+      "G" + (r + 2)
+    ];
+
+    let temConteudo = false;
+    for (let i = 0; i < campos.length; i++) {
+      const valor = String(sh.getRange(campos[i]).getDisplayValue() || "").trim();
+      if (valor) {
+        temConteudo = true;
+        break;
+      }
+    }
+
+    if (!temConteudo) return { baseRow: r };
   }
 
   return null;
@@ -2671,8 +2689,8 @@ function payPreencherBlocoPagamento_(sh, baseRow, item) {
   sh.getRange("G" + (baseRow + 2)).setValue(item.quitado || PAY_QUITADO_PADRAO);
 
   const origemNota =
-    item.source_kind === "pdf_extrato"
-      ? "Extrato Inter PDF / Gmail / Telegram"
+    item.source_kind === "pdf_extrato" || item.source_kind === "drive_folder_pdf"
+      ? "Extrato Inter PDF / Drive / Telegram"
       : "Inter Gmail / Telegram";
 
   const nota = [
