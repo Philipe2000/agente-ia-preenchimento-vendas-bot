@@ -2443,6 +2443,16 @@ app.post("/telegram/webhook", async (req, res) => {
       const handledPagamentosPending = await tryHandlePagamentosPendingCommands(chatId, transcription);
       if (handledPagamentosPending) return;
 
+      if (isPagamentosIntent(transcription, msg)) {
+        await handlePagamentosMessage({
+          message: msg,
+          text: transcription,
+          transcription,
+          sendTelegramMessage
+        });
+        return;
+      }
+
       if (isRecebimentosIntent(transcription, msg)) {
         const lastPdf = getUsableLastPdfContext(chatId);
 
@@ -2471,16 +2481,6 @@ app.post("/telegram/webhook", async (req, res) => {
           sendTelegramMessage,
           documentText: lastPdf?.documentText || "",
           documentJson: lastPdf?.documentJson || null
-        });
-        return;
-      }
-
-      if (isPagamentosIntent(transcription, msg)) {
-        await handlePagamentosMessage({
-          message: msg,
-          text: transcription,
-          transcription,
-          sendTelegramMessage
         });
         return;
       }
@@ -2515,6 +2515,15 @@ app.post("/telegram/webhook", async (req, res) => {
       const handledPagamentosPending = await tryHandlePagamentosPendingCommands(chatId, text);
       if (handledPagamentosPending) return;
 
+      if (isPagamentosIntent(text, msg)) {
+        await handlePagamentosMessage({
+          message: msg,
+          text,
+          sendTelegramMessage
+        });
+        return;
+      }
+
       if (isRecebimentosIntent(text, msg)) {
         const lastPdf = getUsableLastPdfContext(chatId);
 
@@ -2542,15 +2551,6 @@ app.post("/telegram/webhook", async (req, res) => {
           sendTelegramMessage,
           documentText: lastPdf?.documentText || "",
           documentJson: lastPdf?.documentJson || null
-        });
-        return;
-      }
-
-      if (isPagamentosIntent(text, msg)) {
-        await handlePagamentosMessage({
-          message: msg,
-          text,
-          sendTelegramMessage
         });
         return;
       }

@@ -58,6 +58,15 @@ function extractSpecificDates(text = "") {
 function isRecebimentosIntent(text = "", message = {}) {
   const t = normalizeText(text);
 
+  if (
+    t.includes("pagamento") ||
+    t.includes("pagamentos") ||
+    t.includes("contas a pagar") ||
+    t.includes("preencher pagamentos")
+  ) {
+    return false;
+  }
+
   if (message?.document) {
     const name = String(message.document.file_name || "").toLowerCase();
     const mime = String(message.document.mime_type || "").toLowerCase();
