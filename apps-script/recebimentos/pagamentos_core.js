@@ -70,6 +70,9 @@ const PAY_PHILIPE_PERSONAL_RULES = [
     hints: [
       "ifood",
       "i food",
+      "arcos dourados",
+      "mangai",
+      "mangai pb",
       "mcdonalds",
       "mc donalds",
       "burger king",
@@ -725,6 +728,73 @@ function payDescreverDatasPermitidasPrompt_(datasPermitidas) {
   );
 }
 
+function payDatasPermitidasOrdenadas_(datasPermitidas) {
+  return Object.keys(datasPermitidas || {}).filter(Boolean).sort();
+}
+
+function payNormalizarPagamentosExtraidosInter_(out) {
+  out.pagamentos = Array.isArray(out.pagamentos) ? out.pagamentos : [];
+
+  out.pagamentos = out.pagamentos
+    .map(function(item) {
+      return {
+        tipo_pagamento: payNormalizarTipoPagamentoInter_(item.tipo_pagamento || "") || null,
+        data_pagamento: String(item.data_pagamento || "").trim() || null,
+        nome_favorecido: String(item.nome_favorecido || "").trim() || null,
+        descricao_pagamento: String(item.descricao_pagamento || "").trim() || null,
+        cpf_cnpj: String(item.cpf_cnpj || "").trim() || null,
+        valor: item.valor != null ? Math.abs(Number(item.valor)) : null,
+        id_transacao: String(item.id_transacao || "").trim() || null,
+        linha_resumo: String(item.linha_resumo || "").trim() || null
+      };
+    })
+    .filter(function(item) {
+      return (
+        item &&
+        item.data_pagamento &&
+        item.valor != null &&
+        isFinite(Number(item.valor)) &&
+        Number(item.valor) > 0 &&
+        ["debito_compra", "pix_enviado"].indexOf(
+          payNormalizarTipoPagamentoInter_(item.tipo_pagamento || "")
+        ) >= 0
+      );
+    });
+
+  return out;
+}
+
+function payMergePagamentosExtraidosInter_(base, extra) {
+  const merged = [];
+  const seen = {};
+
+  function addItem(item) {
+    const key = [
+      String(item.data_pagamento || ""),
+      payFormatValorChave_(item.valor),
+      payNorm_(item.tipo_pagamento || ""),
+      payNorm_(item.nome_favorecido || item.descricao_pagamento || item.linha_resumo || "")
+    ].join("__");
+
+    if (seen[key]) return;
+    seen[key] = true;
+    merged.push(item);
+  }
+
+  (base || []).forEach(addItem);
+  (extra || []).forEach(addItem);
+
+  merged.sort(function(a, b) {
+    const ka = String(a.data_pagamento || "") + "__" + payFormatValorChave_(a.valor);
+    const kb = String(b.data_pagamento || "") + "__" + payFormatValorChave_(b.valor);
+    if (ka < kb) return -1;
+    if (ka > kb) return 1;
+    return 0;
+  });
+
+  return merged;
+}
+
 function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
   const apiKey = getScriptPropOrThrowInter_("OPENAI_API_KEY");
   const blob = payGetBlobFromSource_(anexoPdf);
@@ -785,6 +855,10 @@ function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
     "Ele deve ser um extrato bancário do Banco Inter.",
     payDescreverDatasPermitidasPrompt_(datasPermitidas),
     "",
+    "Seu objetivo e EXAUSTIVO: encontrar TODAS as saídas das datas pedidas, em TODAS as páginas relevantes.",
+    "Se houver várias compras no mesmo dia, retorne uma entrada separada para CADA linha.",
+    "Não pare na primeira compra encontrada de um dia.",
+    "",
     "Extraia somente SAÍDAS efetivas de dinheiro da conta.",
     "Considere como pagamentos válidos apenas:",
     '- "Compra no debito"',
@@ -812,7 +886,14 @@ function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
     "Padrões comuns no Inter:",
     '- Compra no debito: "No estabelecimento ..."',
     '- Pix enviado: "Cp :...-NOME"',
-    '- Pix recebido: "Cp :...-NOME"'
+    '- Pix recebido: "Cp :...-NOME"',
+    "",
+    "Exemplos de estabelecimentos que podem aparecer como compra no débito:",
+    '- "IFD*ARCOS DOURADOS"',
+    '- "IFD*IFOOD CLUB"',
+    '- "POSTO EXPRESSAO"',
+    '- "SUBWAY"',
+    '- "MANGAI"'
   ].join("\n");
 
   const payload = {
@@ -863,36 +944,143 @@ function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
     throw new Error("A OpenAI respondeu sem texto utilizável para o extrato do Inter.");
   }
 
-  const out = JSON.parse(texto);
-  out.pagamentos = Array.isArray(out.pagamentos) ? out.pagamentos : [];
+  return payNormalizarPagamentosExtraidosInter_(JSON.parse(texto));
+}
 
-  out.pagamentos = out.pagamentos
-    .map(function(item) {
-      return {
-        tipo_pagamento: payNormalizarTipoPagamentoInter_(item.tipo_pagamento || "") || null,
-        data_pagamento: String(item.data_pagamento || "").trim() || null,
-        nome_favorecido: String(item.nome_favorecido || "").trim() || null,
-        descricao_pagamento: String(item.descricao_pagamento || "").trim() || null,
-        cpf_cnpj: String(item.cpf_cnpj || "").trim() || null,
-        valor: item.valor != null ? Math.abs(Number(item.valor)) : null,
-        id_transacao: String(item.id_transacao || "").trim() || null,
-        linha_resumo: String(item.linha_resumo || "").trim() || null
-      };
-    })
-    .filter(function(item) {
-      return (
-        item &&
-        item.data_pagamento &&
-        item.valor != null &&
-        isFinite(Number(item.valor)) &&
-        Number(item.valor) > 0 &&
-        ["debito_compra", "pix_enviado"].indexOf(
-          payNormalizarTipoPagamentoInter_(item.tipo_pagamento || "")
-        ) >= 0
-      );
-    });
+function payAnalisarExtratoInterPdfFocadoPorDataComOpenAI_(anexoPdf, datasPermitidas) {
+  const apiKey = getScriptPropOrThrowInter_("OPENAI_API_KEY");
+  const blob = payGetBlobFromSource_(anexoPdf);
+  const nomeArquivo = String(anexoPdf.getName() || "extrato_inter.pdf");
+  const mime = String(blob.getContentType() || "application/pdf").toLowerCase();
+  const base64 = Utilities.base64Encode(blob.getBytes());
+  const dataUrl = "data:" + mime + ";base64," + base64;
 
-  return out;
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      extrato_detectado: { type: "boolean" },
+      banco: { type: ["string", "null"] },
+      periodo_inicial: { type: ["string", "null"] },
+      periodo_final: { type: ["string", "null"] },
+      pagamentos: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            tipo_pagamento: { type: ["string", "null"] },
+            data_pagamento: { type: ["string", "null"] },
+            nome_favorecido: { type: ["string", "null"] },
+            descricao_pagamento: { type: ["string", "null"] },
+            cpf_cnpj: { type: ["string", "null"] },
+            valor: { type: ["number", "null"] },
+            id_transacao: { type: ["string", "null"] },
+            linha_resumo: { type: ["string", "null"] }
+          },
+          required: [
+            "tipo_pagamento",
+            "data_pagamento",
+            "nome_favorecido",
+            "descricao_pagamento",
+            "cpf_cnpj",
+            "valor",
+            "id_transacao",
+            "linha_resumo"
+          ]
+        }
+      },
+      observacoes: { type: ["string", "null"] }
+    },
+    required: [
+      "extrato_detectado",
+      "banco",
+      "periodo_inicial",
+      "periodo_final",
+      "pagamentos",
+      "observacoes"
+    ]
+  };
+
+  const datas = payDatasPermitidasOrdenadas_(datasPermitidas);
+  const prompt = [
+    "Analise o PDF anexado como imagem e documento.",
+    "Ele deve ser um extrato bancário do Banco Inter.",
+    "Considere SOMENTE estas datas: " + datas.join(", ") + ".",
+    "",
+    "Tarefa EXAUSTIVA e focada:",
+    "- Localize a seção visual dessas datas no extrato.",
+    "- Retorne TODAS as linhas de saída dessas datas, na ordem em que aparecem.",
+    "- Se houver 6 compras no mesmo dia, o array precisa ter 6 itens.",
+    "- Não pare na primeira ocorrência.",
+    "",
+    "Considere apenas como pagamento válido:",
+    '- \"Compra no debito\"',
+    '- \"Pix enviado\"',
+    "",
+    "Ignore:",
+    '- \"Pix recebido\"',
+    '- \"Estorno\"',
+    "",
+    "Exemplos reais que podem aparecer no mesmo dia:",
+    '- \"IFD*ARCOS DOURADOS COM JOAO PESSOA BRA\"',
+    '- \"IFD*IFOOD CLUB Osasco BRA\"',
+    '- \"POSTO EXPRESSAO MATRIZ JOAO PESSOA BRA\"',
+    '- \"SUBWAY Joao Pessoa BRA\"',
+    '- \"MANGAI PB JOAO PESSOA BRA\"',
+    "",
+    "Retorne APENAS JSON válido no schema."
+  ].join("\n");
+
+  const payload = {
+    model: PAY_INTER_OPENAI_MODEL,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          {
+            type: "input_file",
+            filename: nomeArquivo,
+            file_data: dataUrl
+          }
+        ]
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "captura_pagamentos_extrato_inter_pdf_focado",
+        strict: true,
+        schema: schema
+      }
+    }
+  };
+
+  const resp = UrlFetchApp.fetch("https://api.openai.com/v1/responses", {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      Authorization: "Bearer " + apiKey
+    },
+    muteHttpExceptions: true,
+    payload: JSON.stringify(payload)
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText();
+
+  if (code < 200 || code >= 300) {
+    throw new Error("OpenAI HTTP " + code + " no segundo passe focado do extrato do Inter: " + body);
+  }
+
+  const js = JSON.parse(body);
+  const texto = extrairTextoOpenAIInter_(js);
+  if (!texto) {
+    throw new Error("A OpenAI respondeu sem texto utilizável no segundo passe focado do extrato do Inter.");
+  }
+
+  return payNormalizarPagamentosExtraidosInter_(JSON.parse(texto));
 }
 
 function payValorCentavosExtratoTxt_(texto) {
@@ -1047,6 +1235,42 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
       candidato.attachment,
       payMontarJanelaDatasPorPeriodo_(periodo)
     );
+
+    const datas = payDatasPermitidasOrdenadas_(payMontarJanelaDatasPorPeriodo_(periodo));
+    if (
+      parsed &&
+      parsed.extrato_detectado &&
+      datas.length > 0 &&
+      datas.length <= 3 &&
+      Array.isArray(parsed.pagamentos) &&
+      parsed.pagamentos.length <= 1
+    ) {
+      try {
+        const focused = payAnalisarExtratoInterPdfFocadoPorDataComOpenAI_(
+          candidato.attachment,
+          payMontarJanelaDatasPorPeriodo_(periodo)
+        );
+
+        parsed.pagamentos = payMergePagamentosExtraidosInter_(
+          parsed.pagamentos || [],
+          focused.pagamentos || []
+        );
+
+        if (!parsed.observacoes) {
+          parsed.observacoes = "";
+        }
+        parsed.observacoes =
+          String(parsed.observacoes || "") +
+          (parsed.observacoes ? " | " : "") +
+          "Segundo passe focado por data executado.";
+      } catch (e) {
+        parsed.observacoes =
+          String(parsed.observacoes || "") +
+          (parsed.observacoes ? " | " : "") +
+          "Falha no segundo passe focado: " + String(e);
+      }
+    }
+
     parsed.cache_type = PAY_EXTRATO_CACHE_TYPE;
     parsed.cached_at = new Date().toISOString();
     payGravarRegistroNoDrive_(cacheFileName, parsed);

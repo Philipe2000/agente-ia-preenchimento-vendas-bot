@@ -1265,6 +1265,9 @@ function summarizePendingPagamentos(lote) {
   if (lote?.mensagem_origem) {
     linhas.push(`Observação: ${String(lote.mensagem_origem)}`);
   }
+  if (lote?.observacoes_extrato) {
+    linhas.push(`Leitura do extrato: ${String(lote.observacoes_extrato)}`);
+  }
   linhas.push(`Período: ${lote?.periodo?.label || "não informado"}`);
   linhas.push(`Prontos para preencher: ${prontos.length}`);
   linhas.push(`Pendências: ${pendencias.length}`);
@@ -1650,6 +1653,7 @@ async function handlePagamentosMessage(ctx) {
       fonte_dados: result.fonte_dados || "",
       attachment_name: result.attachment_name || "",
       mensagem_origem: result.message || "",
+      observacoes_extrato: result.observacoes_extrato || "",
       periodo: result.periodo || parsed.periodo,
       criadoEm: new Date().toISOString(),
       resumoOrigem: {
