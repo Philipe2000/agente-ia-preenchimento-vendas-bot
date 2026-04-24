@@ -106,10 +106,43 @@ function telegramFileUrl(filePath) {
 }
 
 async function sendTelegramMessage(chatId, text) {
-  return axios.post(telegramApiUrl("sendMessage"), {
-    chat_id: chatId,
-    text
-  });
+  const mensagem = String(text || "");
+  const partes = splitTelegramMessage_(mensagem);
+  let lastResp = null;
+
+  for (let i = 0; i < partes.length; i++) {
+    lastResp = await axios.post(telegramApiUrl("sendMessage"), {
+      chat_id: chatId,
+      text: partes[i]
+    });
+  }
+
+  return lastResp;
+}
+
+function splitTelegramMessage_(text, maxLen = 3500) {
+  const mensagem = String(text || "");
+  if (!mensagem) return [""];
+  if (mensagem.length <= maxLen) return [mensagem];
+
+  const partes = [];
+  let restante = mensagem;
+
+  while (restante.length > maxLen) {
+    let corte = restante.lastIndexOf("\n", maxLen);
+    if (corte < Math.floor(maxLen * 0.6)) {
+      corte = restante.lastIndexOf(" ", maxLen);
+    }
+    if (corte < Math.floor(maxLen * 0.4)) {
+      corte = maxLen;
+    }
+
+    partes.push(restante.slice(0, corte).trim());
+    restante = restante.slice(corte).trim();
+  }
+
+  if (restante) partes.push(restante);
+  return partes.filter(Boolean);
 }
 
 async function getTelegramFile(fileId) {

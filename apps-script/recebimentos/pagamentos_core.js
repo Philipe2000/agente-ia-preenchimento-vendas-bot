@@ -2405,6 +2405,59 @@ function payResolverPlanoPagamentoInter_(pagamento) {
   };
 }
 
+function payGetNomeItemGc_(item, fields) {
+  for (let i = 0; i < fields.length; i++) {
+    const valor = String(item && item[fields[i]] || "").trim();
+    if (valor) return valor;
+  }
+  return "";
+}
+
+function payResolverNomeOficialDaLista_(nomeDesejado, lista, fields) {
+  const alvo = payNorm_(nomeDesejado || "");
+  if (!alvo) return "";
+
+  for (let i = 0; i < (lista || []).length; i++) {
+    const nome = payGetNomeItemGc_(lista[i], fields);
+    if (payNorm_(nome) === alvo) return nome;
+  }
+
+  for (let j = 0; j < (lista || []).length; j++) {
+    const nome = payGetNomeItemGc_(lista[j], fields);
+    const nomeNorm = payNorm_(nome);
+    if (!nomeNorm) continue;
+    if (nomeNorm.indexOf(alvo) >= 0 || alvo.indexOf(nomeNorm) >= 0) {
+      return nome;
+    }
+  }
+
+  return "";
+}
+
+function payResolverNomePlanoContasOficial_(nomeDesejado) {
+  return payResolverNomeOficialDaLista_(
+    nomeDesejado,
+    payListarPlanosContasGC_(),
+    ["nome", "descricao", "titulo"]
+  );
+}
+
+function payResolverNomeContaBancariaOficial_(nomeDesejado) {
+  return payResolverNomeOficialDaLista_(
+    nomeDesejado,
+    payListarContasBancariasGC_(),
+    ["nome", "descricao", "banco"]
+  );
+}
+
+function payResolverNomeFormaPagamentoOficial_(nomeDesejado) {
+  return payResolverNomeOficialDaLista_(
+    nomeDesejado,
+    payListarFormasPagamentoGC_(),
+    ["nome", "descricao"]
+  );
+}
+
 function payAplicarRegrasEspeciais_(pagamento) {
   const nome = payNorm_(pagamento.nome_favorecido || "");
   const descricao = payNorm_(pagamento.descricao_pagamento || "");
@@ -2423,7 +2476,7 @@ function payAplicarRegrasEspeciais_(pagamento) {
     if (texto.indexOf(payNorm_(PAY_DIRECT_PLAN_RULES[j].match)) >= 0) {
       return {
         acao: "usar",
-        plano: PAY_DIRECT_PLAN_RULES[j].plano,
+        plano: payResolverNomePlanoContasOficial_(PAY_DIRECT_PLAN_RULES[j].plano) || PAY_DIRECT_PLAN_RULES[j].plano,
         motivo: "regra_direta_salario"
       };
     }
@@ -2437,7 +2490,7 @@ function payAplicarRegrasEspeciais_(pagamento) {
   if (payEhEntregaMotoboy_(pagamento)) {
     return {
       acao: "usar",
-      plano: PAY_PLANO_ENTREGA_MOTOBOY,
+      plano: payResolverNomePlanoContasOficial_(PAY_PLANO_ENTREGA_MOTOBOY) || PAY_PLANO_ENTREGA_MOTOBOY,
       motivo: "regra_direta_entrega_motoboy"
     };
   }
@@ -2480,7 +2533,7 @@ function payResolverPlanoDespesaPessoal_(pagamento) {
       if (texto.indexOf(payNorm_(regra.hints[j])) >= 0) {
         return {
           acao: "usar",
-          plano: PAY_PLANO_SALARIO_PHILIPE,
+          plano: payResolverNomePlanoContasOficial_(PAY_PLANO_SALARIO_PHILIPE) || PAY_PLANO_SALARIO_PHILIPE,
           motivo: "regra_despesa_pessoal_" + regra.motivo
         };
       }
@@ -2697,10 +2750,28 @@ function paySetCellValueSafe_(sh, a1, value) {
 }
 
 function payPreencherBlocoPagamento_(sh, baseRow, item) {
+  const planoContas =
+    payResolverNomePlanoContasOficial_(item.plano_contas || item.descricao_pagamento || "") ||
+    item.plano_contas ||
+    item.descricao_pagamento ||
+    "";
+  const descricaoPagamento =
+    payResolverNomePlanoContasOficial_(item.descricao_pagamento || item.plano_contas || "") ||
+    item.descricao_pagamento ||
+    planoContas;
+  const contaOficial =
+    payResolverNomeContaBancariaOficial_(item.conta_oficial || PAY_INTER_CONTA_OFICIAL) ||
+    item.conta_oficial ||
+    PAY_INTER_CONTA_OFICIAL;
+  const formaPagamento =
+    payResolverNomeFormaPagamentoOficial_(item.forma || PAY_FORMA_PADRAO) ||
+    item.forma ||
+    PAY_FORMA_PADRAO;
+
   paySetCellValueSafe_(
     sh,
     "D" + baseRow,
-    item.descricao_pagamento || item.plano_contas || ""
+    descricaoPagamento
   );
   paySetCellValueSafe_(
     sh,
@@ -2713,11 +2784,11 @@ function payPreencherBlocoPagamento_(sh, baseRow, item) {
     valorRange.setNumberFormat("0.00");
   }
 
-  paySetCellValueSafe_(sh, "D" + (baseRow + 1), item.plano_contas || "");
+  paySetCellValueSafe_(sh, "D" + (baseRow + 1), planoContas);
   paySetCellValueSafe_(
     sh,
     "G" + (baseRow + 1),
-    item.conta_oficial || PAY_INTER_CONTA_OFICIAL
+    contaOficial
   );
   paySetCellValueSafe_(
     sh,
@@ -2725,7 +2796,7 @@ function payPreencherBlocoPagamento_(sh, baseRow, item) {
     item.data_compensacao || item.data_pagamento || ""
   );
 
-  paySetCellValueSafe_(sh, "D" + (baseRow + 2), item.forma || PAY_FORMA_PADRAO);
+  paySetCellValueSafe_(sh, "D" + (baseRow + 2), formaPagamento);
   paySetCellValueSafe_(sh, "G" + (baseRow + 2), item.quitado || PAY_QUITADO_PADRAO);
 
   const origemNota =
@@ -2737,9 +2808,9 @@ function payPreencherBlocoPagamento_(sh, baseRow, item) {
     "Origem: " + origemNota,
     "Nome extraído: " + (item.nome_extraido || ""),
     "Descrição extraída: " + (item.descricao_extraida || ""),
-    "Plano de contas: " + (item.plano_contas || ""),
-    "Conta: " + (item.conta_oficial || PAY_INTER_CONTA_OFICIAL),
-    "Forma: " + (item.forma || PAY_FORMA_PADRAO),
+    "Plano de contas: " + planoContas,
+    "Conta: " + contaOficial,
+    "Forma: " + formaPagamento,
     "Quitado: " + (item.quitado || PAY_QUITADO_PADRAO),
     "Data compensação: " + (item.data_compensacao || item.data_pagamento || ""),
     "CPF/CNPJ: " + (item.cpf_cnpj || ""),
