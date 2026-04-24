@@ -2184,7 +2184,11 @@ function confirmarLotePagamentosInter_(payload) {
 
       payGravarRegistroNoDrive_(chaveDuplicidade.fileName, registroJson);
 
-      if (item.message_id && item.source_kind !== "pdf_extrato") {
+      if (
+        item.message_id &&
+        item.source_kind !== "pdf_extrato" &&
+        item.source_kind !== "drive_folder_pdf"
+      ) {
         payGravarRegistroNoDrive_(
           payMontarChaveMensagemInter_(fakeMsg),
           {
@@ -2200,7 +2204,11 @@ function confirmarLotePagamentosInter_(payload) {
         );
       }
 
-      if (item.message_id && item.source_kind !== "pdf_extrato") {
+      if (
+        item.message_id &&
+        item.source_kind !== "pdf_extrato" &&
+        item.source_kind !== "drive_folder_pdf"
+      ) {
         marcarMensagemInterComoProcessadaSePossivel_(item.message_id);
       }
 
@@ -2672,21 +2680,53 @@ function payGetPrimeiroBlocoLivre_(sh) {
   return null;
 }
 
+function payGetWritableRange_(sh, a1) {
+  const range = sh.getRange(a1);
+  if (!range.isPartOfMerge()) return range;
+
+  const merged = range.getMergedRanges();
+  if (!merged || !merged.length) return range;
+
+  return merged[0].getCell(1, 1);
+}
+
+function paySetCellValueSafe_(sh, a1, value) {
+  const range = payGetWritableRange_(sh, a1);
+  range.setValue(value);
+  return range;
+}
+
 function payPreencherBlocoPagamento_(sh, baseRow, item) {
-  sh.getRange("D" + baseRow).setValue(item.descricao_pagamento || item.plano_contas || "");
-  sh.getRange("G" + baseRow).setValue(item.vencimento || item.data_pagamento || "");
+  paySetCellValueSafe_(
+    sh,
+    "D" + baseRow,
+    item.descricao_pagamento || item.plano_contas || ""
+  );
+  paySetCellValueSafe_(
+    sh,
+    "G" + baseRow,
+    item.vencimento || item.data_pagamento || ""
+  );
 
   if (item.valor != null && isFinite(Number(item.valor))) {
-    sh.getRange("I" + baseRow).setValue(Number(item.valor));
-    sh.getRange("I" + baseRow).setNumberFormat("0.00");
+    const valorRange = paySetCellValueSafe_(sh, "I" + baseRow, Number(item.valor));
+    valorRange.setNumberFormat("0.00");
   }
 
-  sh.getRange("D" + (baseRow + 1)).setValue(item.plano_contas || "");
-  sh.getRange("G" + (baseRow + 1)).setValue(item.conta_oficial || PAY_INTER_CONTA_OFICIAL);
-  sh.getRange("I" + (baseRow + 1)).setValue(item.data_compensacao || item.data_pagamento || "");
+  paySetCellValueSafe_(sh, "D" + (baseRow + 1), item.plano_contas || "");
+  paySetCellValueSafe_(
+    sh,
+    "G" + (baseRow + 1),
+    item.conta_oficial || PAY_INTER_CONTA_OFICIAL
+  );
+  paySetCellValueSafe_(
+    sh,
+    "I" + (baseRow + 1),
+    item.data_compensacao || item.data_pagamento || ""
+  );
 
-  sh.getRange("D" + (baseRow + 2)).setValue(item.forma || PAY_FORMA_PADRAO);
-  sh.getRange("G" + (baseRow + 2)).setValue(item.quitado || PAY_QUITADO_PADRAO);
+  paySetCellValueSafe_(sh, "D" + (baseRow + 2), item.forma || PAY_FORMA_PADRAO);
+  paySetCellValueSafe_(sh, "G" + (baseRow + 2), item.quitado || PAY_QUITADO_PADRAO);
 
   const origemNota =
     item.source_kind === "pdf_extrato" || item.source_kind === "drive_folder_pdf"
@@ -2709,7 +2749,7 @@ function payPreencherBlocoPagamento_(sh, baseRow, item) {
     "Anexo PDF: " + (item.attachment_name || "")
   ].join("\n");
 
-  sh.getRange("D" + baseRow).setNote(nota);
+  payGetWritableRange_(sh, "D" + baseRow).setNote(nota);
 }
 
 function payMontarChaveDuplicidadeInter_(pagamento, msg) {

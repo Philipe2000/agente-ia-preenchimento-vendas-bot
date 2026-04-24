@@ -2620,7 +2620,13 @@ app.post("/telegram/webhook", async (req, res) => {
       const chatId = msg?.chat?.id;
 
       if (chatId) {
-        await sendTelegramMessage(chatId, "Tive um erro ao processar sua mensagem.");
+        const detalhe = String(error?.message || "").trim();
+        await sendTelegramMessage(
+          chatId,
+          detalhe
+            ? `Tive um erro ao processar sua mensagem.\n\nDetalhe: ${detalhe}`
+            : "Tive um erro ao processar sua mensagem."
+        );
       }
     } catch (err2) {
       console.error("Erro ao enviar mensagem de falha:", err2.message || err2);
