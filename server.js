@@ -939,6 +939,8 @@ async function tryHandleRecebimentosPendingCommands(chatId, text) {
       assunto_email: pendencia.assunto_email || "",
       remetente: pendencia.remetente || "",
       message_id: pendencia.message_id || "",
+      source_kind: pendencia.source_kind || "",
+      attachment_name: pendencia.attachment_name || "",
       status: "pronto"
     };
 
@@ -1334,6 +1336,8 @@ function buildForcedPagamentoFromDuplicate(lote, duplicado) {
     assunto_email: duplicado.assunto_email || "",
     remetente: duplicado.remetente || "",
     message_id: duplicado.message_id || "",
+    source_kind: duplicado.source_kind || "",
+    attachment_name: duplicado.attachment_name || "",
     status: "pronto",
     force_duplicate: true,
     duplicate_source: duplicado.motivo || "duplicado_gc",

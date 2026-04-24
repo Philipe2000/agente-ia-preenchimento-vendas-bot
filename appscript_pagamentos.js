@@ -1,8 +1,8 @@
 const axios = require("axios");
 
 const GOOGLE_APPS_SCRIPT_PAGAMENTOS_WEBAPP_URL =
-  process.env.GOOGLE_APPS_SCRIPT_PAGAMENTOS_WEBAPP_URL ||
   process.env.GOOGLE_APPS_SCRIPT_RECEBIMENTOS_WEBAPP_URL ||
+  process.env.GOOGLE_APPS_SCRIPT_PAGAMENTOS_WEBAPP_URL ||
   "";
 
 async function callPagamentosWebApp(payload) {
