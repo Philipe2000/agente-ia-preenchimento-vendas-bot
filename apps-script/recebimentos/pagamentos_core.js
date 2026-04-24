@@ -23,7 +23,7 @@ const PAY_ROW_START = 93;
 const PAY_ROW_END = 120;
 const PAY_STEP = 3;
 
-const PAY_INTER_OPENAI_MODEL = "gpt-4.1";
+const PAY_INTER_OPENAI_MODEL = "gpt-5";
 const PAY_LOG_FOLDER_ID = INTER_DRIVE_FOLDER_ID_LOG;
 
 const PAY_ENDPOINT_PLANOS_1 = "/api/planos_contas";
@@ -40,8 +40,8 @@ const PAY_GMAIL_LABEL_DUPLICADO = "pay-duplicado";
 const PAY_GMAIL_LABEL_ERRO = "pay-erro";
 const PAY_GMAIL_LABEL_IGNORADO = "pay-ignorado";
 const PAY_GMAIL_QUERY_EXTRATO_INTER = "from:no-reply@inter.co has:attachment newer_than:180d";
-const PAY_EXTRATO_CACHE_PREFIX = "PAYINTER_EXTRATO_PARSE_V2__";
-const PAY_EXTRATO_CACHE_TYPE = "inter_pdf_pagamentos_periodo_v2";
+const PAY_EXTRATO_CACHE_PREFIX = "PAYINTER_EXTRATO_PARSE_V3__";
+const PAY_EXTRATO_CACHE_TYPE = "inter_pdf_pagamentos_periodo_v3";
 const PAY_INTER_EXTRATO_DRIVE_FOLDER_ID = "1oJCd0cfQeU5Z5v0UaYvI1Cjr9H7psagD";
 
 const PAY_IGNORE_NAMES = [
@@ -898,6 +898,9 @@ function payAnalisarExtratoInterPdfComOpenAI_(anexoPdf, datasPermitidas) {
 
   const payload = {
     model: PAY_INTER_OPENAI_MODEL,
+    reasoning: {
+      effort: "medium"
+    },
     input: [
       {
         role: "user",
@@ -1034,6 +1037,9 @@ function payAnalisarExtratoInterPdfFocadoPorDataComOpenAI_(anexoPdf, datasPermit
 
   const payload = {
     model: PAY_INTER_OPENAI_MODEL,
+    reasoning: {
+      effort: "medium"
+    },
     input: [
       {
         role: "user",
