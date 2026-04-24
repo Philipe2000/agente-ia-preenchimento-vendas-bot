@@ -629,6 +629,65 @@ function payListarCandidatosExtratoInterDrive_(periodo) {
   return out;
 }
 
+function paySincronizarExtratoInterGmailParaDrive_(periodo) {
+  const candidatosGmail = payListarCandidatosExtratoInter_(periodo);
+  if (!candidatosGmail.length) {
+    return {
+      ok: true,
+      encontrados: 0,
+      copiados: 0,
+      reutilizados: 0,
+      message: "Nenhum extrato PDF do Inter encontrado no Gmail para sincronizar."
+    };
+  }
+
+  const folder = DriveApp.getFolderById(PAY_INTER_EXTRATO_DRIVE_FOLDER_ID);
+  const candidato = candidatosGmail[0];
+  const nomeArquivo =
+    String(candidato.attachment_name || "") ||
+    String(candidato.attachment && candidato.attachment.getName ? candidato.attachment.getName() : "") ||
+    ("Extrato-Inter-" + String(candidato.message_id || new Date().getTime()) + ".pdf");
+
+  const existentes = folder.getFilesByName(nomeArquivo);
+  if (existentes.hasNext()) {
+    return {
+      ok: true,
+      encontrados: candidatosGmail.length,
+      copiados: 0,
+      reutilizados: 1,
+      attachment_name: nomeArquivo,
+      message: "Extrato do Gmail já estava disponível na pasta do Drive."
+    };
+  }
+
+  const blob = payGetBlobFromSource_(candidato.attachment).setName(nomeArquivo);
+  const file = folder.createFile(blob);
+
+  try {
+    file.setDescription(
+      [
+        "Sincronizado automaticamente do Gmail para pagamentos Inter.",
+        "Assunto: " + String(candidato.assunto_email || ""),
+        "Remetente: " + String(candidato.remetente || ""),
+        "Message ID: " + String(candidato.message_id || ""),
+        "Sincronizado em: " + new Date().toISOString()
+      ].join("\n")
+    );
+  } catch (e) {
+    Logger.log("Não consegui salvar a descrição do extrato sincronizado: " + e);
+  }
+
+  return {
+    ok: true,
+    encontrados: candidatosGmail.length,
+    copiados: 1,
+    reutilizados: 0,
+    attachment_name: nomeArquivo,
+    drive_file_id: String(file.getId() || ""),
+    message: "Extrato do Gmail sincronizado automaticamente para a pasta do Drive."
+  };
+}
+
 function payListarCandidatosExtratoInter_(periodo) {
   const datasPermitidas = payMontarJanelaDatasPorPeriodo_(periodo);
   const threads = GmailApp.search(PAY_GMAIL_QUERY_EXTRATO_INTER, 0, 80);
@@ -1216,6 +1275,13 @@ function payAnalisarExtratoInterTxt_(anexoTxt, datasPermitidas) {
 }
 
 function payObterPagamentosDoMelhorExtratoInter_(periodo) {
+  let syncInfo = null;
+  try {
+    syncInfo = paySincronizarExtratoInterGmailParaDrive_(periodo);
+  } catch (e) {
+    Logger.log("Falha ao sincronizar extrato do Gmail para o Drive: " + e);
+  }
+
   const candidatosDrive = payListarCandidatosExtratoInterDrive_(periodo);
   const candidatosGmail = payListarCandidatosExtratoInter_(periodo);
   const candidatos = candidatosDrive.length ? candidatosDrive : candidatosGmail;
@@ -1282,6 +1348,13 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
     payGravarRegistroNoDrive_(cacheFileName, parsed);
   }
 
+  const observacoesExtras = [];
+  if (syncInfo && syncInfo.copiados > 0) {
+    observacoesExtras.push("Extrato sincronizado automaticamente do Gmail para a pasta do Drive.");
+  } else if (syncInfo && syncInfo.reutilizados > 0) {
+    observacoesExtras.push("Extrato já existente na pasta do Drive reaproveitado automaticamente.");
+  }
+
   return {
     ok: true,
     encontrado: true,
@@ -1294,7 +1367,10 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
     pagamentos: Array.isArray(parsed.pagamentos) ? parsed.pagamentos : [],
     extrato_detectado: !!parsed.extrato_detectado,
     banco: parsed.banco || "Inter",
-    observacoes: parsed.observacoes || "",
+    observacoes: [String(parsed.observacoes || "").trim()]
+      .concat(observacoesExtras)
+      .filter(Boolean)
+      .join(" | "),
     origem_extrato: candidatosDrive.length ? "drive_folder_pdf" : "gmail_pdf",
     source_candidate_found: true
   };
