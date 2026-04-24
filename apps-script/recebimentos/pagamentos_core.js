@@ -15,6 +15,9 @@ const PAY_INTER_CONTA_OFICIAL = "Inter Empresas";
 const PAY_ITAU_CONTA_OFICIAL = "Itaú Empresas";
 const PAY_FORMA_PADRAO = "PIX";
 const PAY_QUITADO_PADRAO = "Sim";
+const PAY_PLANO_SALARIO_PHILIPE = "Salario Philipe";
+const PAY_PLANO_SALARIO_LUCCA = "Salario Lucca";
+const PAY_PLANO_ENTREGA_MOTOBOY = "Entrega Motoboy";
 
 const PAY_ROW_START = 93;
 const PAY_ROW_END = 120;
@@ -45,8 +48,86 @@ const PAY_IGNORE_NAMES = [
 ];
 
 const PAY_DIRECT_PLAN_RULES = [
-  { match: "philipe", plano: "Salario Philipe" },
-  { match: "lucca", plano: "Salario Lucca" }
+  { match: "philipe", plano: PAY_PLANO_SALARIO_PHILIPE },
+  { match: "lucca", plano: PAY_PLANO_SALARIO_LUCCA }
+];
+
+const PAY_MOTOBOY_HINTS = [
+  "99",
+  "99app",
+  "99 app",
+  "99pay",
+  "99 pay"
+];
+
+const PAY_PHILIPE_PERSONAL_RULES = [
+  {
+    motivo: "alimentacao",
+    hints: [
+      "ifood",
+      "i food",
+      "mcdonalds",
+      "mc donalds",
+      "burger king",
+      "bk",
+      "subway",
+      "habibs",
+      "giraffas",
+      "restaurante",
+      "lanchonete",
+      "hamburgueria",
+      "pizzaria",
+      "padaria",
+      "cafeteria",
+      "sorveteria",
+      "churrascaria",
+      "temakeria",
+      "sushi",
+      "acai",
+      "acougue"
+    ]
+  },
+  {
+    motivo: "combustivel",
+    hints: [
+      "posto",
+      "combustivel",
+      "gasolina",
+      "etanol",
+      "shell",
+      "ipiranga",
+      "petrobras",
+      "ale combustiveis",
+      "br mania"
+    ]
+  },
+  {
+    motivo: "cinema",
+    hints: [
+      "cinema",
+      "cinemark",
+      "cinepolis",
+      "cinesystem",
+      "uci"
+    ]
+  },
+  {
+    motivo: "shopping",
+    hints: [
+      "shopping",
+      "mall"
+    ]
+  },
+  {
+    motivo: "estacionamento",
+    hints: [
+      "estacionamento",
+      "estapar",
+      "indigo",
+      "zona azul",
+      "park"
+    ]
+  }
 ];
 
 const PAY_CNPJ_HINTS = [
@@ -1312,6 +1393,19 @@ function payAplicarRegrasEspeciais_(pagamento) {
     }
   }
 
+  const planoDespesaPessoal = payResolverPlanoDespesaPessoal_(pagamento);
+  if (planoDespesaPessoal) {
+    return planoDespesaPessoal;
+  }
+
+  if (payEhEntregaMotoboy_(pagamento)) {
+    return {
+      acao: "usar",
+      plano: PAY_PLANO_ENTREGA_MOTOBOY,
+      motivo: "regra_direta_entrega_motoboy"
+    };
+  }
+
   if (Number(pagamento.valor || 0) > 3000 && payPareceCnpj_(pagamento)) {
     return {
       acao: "ignorar",
@@ -1334,6 +1428,47 @@ function payPareceCnpj_(pagamento) {
 
   for (let i = 0; i < PAY_CNPJ_HINTS.length; i++) {
     if (texto.indexOf(payNorm_(PAY_CNPJ_HINTS[i])) >= 0) return true;
+  }
+
+  return false;
+}
+
+function payResolverPlanoDespesaPessoal_(pagamento) {
+  const texto = payNorm_(
+    (pagamento.nome_favorecido || "") + " " + (pagamento.descricao_pagamento || "")
+  );
+
+  for (let i = 0; i < PAY_PHILIPE_PERSONAL_RULES.length; i++) {
+    const regra = PAY_PHILIPE_PERSONAL_RULES[i];
+    for (let j = 0; j < regra.hints.length; j++) {
+      if (texto.indexOf(payNorm_(regra.hints[j])) >= 0) {
+        return {
+          acao: "usar",
+          plano: PAY_PLANO_SALARIO_PHILIPE,
+          motivo: "regra_despesa_pessoal_" + regra.motivo
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function payEhEntregaMotoboy_(pagamento) {
+  const texto = payNorm_(
+    (pagamento.nome_favorecido || "") + " " + (pagamento.descricao_pagamento || "")
+  );
+
+  if (texto.indexOf("uber") >= 0) return true;
+
+  for (let i = 0; i < PAY_MOTOBOY_HINTS.length; i++) {
+    const hint = payNorm_(PAY_MOTOBOY_HINTS[i]);
+    if (hint === "99") {
+      if (/(^|[^a-z0-9])99([^a-z0-9]|$)/.test(texto)) return true;
+      continue;
+    }
+
+    if (texto.indexOf(hint) >= 0) return true;
   }
 
   return false;
