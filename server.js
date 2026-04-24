@@ -1312,9 +1312,16 @@ async function handleRecebimentosMessage(ctx) {
   }
 
   if (parsed.origem === "itau" && !documentJson) {
+    saveQueuedItauCommand(chatId, {
+      kind: "recebimentos",
+      message,
+      text,
+      transcription: transcription || ""
+    });
+
     await sendTelegramMessage(
       chatId,
-      "Recebi seu comando de recebimentos Itaú, mas ainda não tenho um PDF do Itaú estruturado para usar. Envie primeiro o PDF do extrato e depois diga, por exemplo: 'preencher recebimentos Itaú últimos 7 dias'."
+      "Ainda não tenho um PDF do Itaú pronto para usar. Se você acabou de enviar o extrato, vou esperar um instante e continuar automaticamente. Se não, envie o PDF do extrato."
     );
     return;
   }
@@ -1880,9 +1887,16 @@ async function handlePagamentosMessage(ctx) {
       : null;
 
     if (!pdfCtx?.documentJson) {
+      saveQueuedItauCommand(chatId, {
+        kind: "pagamentos",
+        message,
+        text,
+        transcription: transcription || ""
+      });
+
       await sendTelegramMessage(
         chatId,
-        "Recebi seu comando de pagamentos Itaú, mas ainda não tenho um PDF do Itaú pronto para usar. Envie primeiro o PDF do extrato e depois repita o comando."
+        "Ainda não tenho um PDF do Itaú pronto para usar. Se você acabou de enviar o extrato, vou esperar um instante e continuar automaticamente. Se não, envie o PDF do extrato."
       );
       return;
     }
@@ -2907,9 +2921,16 @@ app.post("/telegram/webhook", async (req, res) => {
         }
 
         if (origemFromContext === "itau" && !lastPdf?.documentJson) {
+          saveQueuedItauCommand(chatId, {
+            kind: "recebimentos",
+            message: msg,
+            text: transcription,
+            transcription
+          });
+
           await sendTelegramMessage(
             chatId,
-            `Transcrição:\n"${transcription}"\n\nRecebi seu comando de Itaú, mas ainda não tenho um PDF do Itaú pronto para usar. Envie primeiro o PDF do extrato e depois repita o comando.`
+            `Transcrição:\n"${transcription}"\n\nAinda não tenho um PDF do Itaú pronto para usar. Se você acabou de enviar o extrato, vou esperar um instante e continuar automaticamente. Se não, envie o PDF do extrato.`
           );
           return;
         }
@@ -2992,9 +3013,15 @@ app.post("/telegram/webhook", async (req, res) => {
         }
 
         if (origemFromContext === "itau" && !lastPdf?.documentJson) {
+          saveQueuedItauCommand(chatId, {
+            kind: "recebimentos",
+            message: msg,
+            text
+          });
+
           await sendTelegramMessage(
             chatId,
-            "Recebi seu comando de recebimentos Itaú, mas ainda não tenho um PDF do Itaú pronto para usar. Envie primeiro o PDF do extrato e depois repita o comando."
+            "Ainda não tenho um PDF do Itaú pronto para usar. Se você acabou de enviar o extrato, vou esperar um instante e continuar automaticamente. Se não, envie o PDF do extrato."
           );
           return;
         }
