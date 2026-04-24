@@ -1642,6 +1642,8 @@ function payAnalisarEmailPagamentoInterComOpenAI_(msg) {
 function processarPagamentosV1_(payload) {
   const origem = String(payload.origem || "").toLowerCase().trim();
   const periodo = payload.periodo || {};
+  const telegram = payload.telegram || {};
+  const meta = payload.message_meta || {};
 
   if (!origem) {
     return {
@@ -1651,19 +1653,319 @@ function processarPagamentosV1_(payload) {
   }
 
   if (origem === "inter") {
-    return preVisualizarPagamentosInter_(periodo, payload.telegram || {}, payload.message_meta || {});
+    return preVisualizarPagamentosInter_(periodo, telegram, meta);
   }
 
   if (origem === "itau") {
-    return {
-      ok: false,
-      message: "Pagamentos Itaú ainda não foram implementados nesta primeira fase."
-    };
+    return preVisualizarPagamentosItau_(periodo, telegram, meta);
   }
 
   return {
     ok: false,
     message: 'Origem inválida. Use "inter" ou "itau".'
+  };
+}
+
+function payFiltrarLancamentosItauPagamentos_(lancamentos) {
+  return (lancamentos || []).filter(function(l) {
+    const tipo = payNormalizarTipoPagamentoInter_(l && l.tipo || "");
+    return (
+      ["pix_enviado", "debito_compra"].indexOf(tipo) >= 0 &&
+      String(l && l.data_pagamento || "").trim() &&
+      isFinite(Number(l && l.valor)) &&
+      Number(l.valor) > 0
+    );
+  });
+}
+
+function payProcessarPagamentoItauParaPrevia_(state, lanc, meta) {
+  const pagamento = {
+    nome_favorecido: payLimparNomePagamento_(lanc.nome_pagador || lanc.linha_resumo || ""),
+    descricao_pagamento: String(lanc.linha_resumo || lanc.nome_pagador || "").trim(),
+    cpf_cnpj: String(lanc.cpf_cnpj || "").trim(),
+    valor: lanc.valor != null ? Number(lanc.valor) : null,
+    id_transacao: String(lanc.id_transacao || "").trim(),
+    banco_email: PAY_ITAU_CONTA_OFICIAL,
+    data_pagamento: String(lanc.data_pagamento || "").trim(),
+    tipo_pagamento: payNormalizarTipoPagamentoInter_(lanc.tipo || "")
+  };
+
+  if (!pagamento.id_transacao) {
+    pagamento.id_transacao = payBuildSyntheticTransactionId_(
+      pagamento,
+      "itau_pdf_extrato"
+    );
+  }
+
+  const fakeMsg = {
+    getId: function() {
+      return String(meta.message_id || "");
+    },
+    getDate: function() {
+      return new Date(String(pagamento.data_pagamento || "") + "T12:00:00");
+    }
+  };
+
+  const regra = payAplicarRegrasEspeciais_(pagamento);
+  if (regra.acao === "ignorar") {
+    state.ignorados.push({
+      motivo: regra.motivo || "ignorado_por_regra",
+      nome_extraido: pagamento.nome_favorecido || "",
+      data_pagamento: pagamento.data_pagamento,
+      valor: pagamento.valor,
+      assunto_email: meta.assunto_email || "",
+      source_kind: meta.source_kind || "pdf_extrato"
+    });
+    return;
+  }
+
+  const chaveDuplicidade = payMontarChaveDuplicidadeInter_(pagamento, fakeMsg);
+  if (payExisteRegistroDrive_(chaveDuplicidade.fileName)) {
+    state.duplicados.push({
+      id_local: "D" + state.seqDup++,
+      motivo: "duplicado_drive_log",
+      nome_extraido: pagamento.nome_favorecido || "",
+      descricao_extraida: pagamento.descricao_pagamento || "",
+      data_pagamento: pagamento.data_pagamento,
+      valor: pagamento.valor,
+      assunto_email: meta.assunto_email || "",
+      remetente: meta.remetente || "",
+      message_id: String(meta.message_id || ""),
+      id_transacao: pagamento.id_transacao || "",
+      banco_extraido: pagamento.banco_email || "",
+      source_kind: meta.source_kind || "pdf_extrato",
+      attachment_name: meta.attachment_name || ""
+    });
+    return;
+  }
+
+  const planoInfo = regra.plano
+    ? {
+        plano_contas: regra.plano,
+        score: 1,
+        motivo: regra.motivo || "regra_direta",
+        acao: "usar"
+      }
+    : payResolverPlanoPagamentoInter_(pagamento);
+
+  if (planoInfo.acao === "ignorar") {
+    state.ignorados.push({
+      motivo: planoInfo.motivo || "ignorado_por_plano",
+      nome_extraido: pagamento.nome_favorecido || "",
+      data_pagamento: pagamento.data_pagamento,
+      valor: pagamento.valor,
+      assunto_email: meta.assunto_email || "",
+      source_kind: meta.source_kind || "pdf_extrato"
+    });
+    return;
+  }
+
+  if (!planoInfo.plano_contas) {
+    state.pendencias_associacao.push({
+      id_local: "P" + state.seqPend++,
+      nome_extraido: pagamento.nome_favorecido || pagamento.descricao_pagamento || "",
+      descricao_extraida: pagamento.descricao_pagamento || "",
+      data_pagamento: pagamento.data_pagamento,
+      data_compensacao: pagamento.data_pagamento,
+      vencimento: pagamento.data_pagamento,
+      valor: pagamento.valor,
+      forma: PAY_FORMA_PADRAO,
+      conta_oficial: PAY_ITAU_CONTA_OFICIAL,
+      banco_extraido: pagamento.banco_email || "",
+      cpf_cnpj: pagamento.cpf_cnpj || "",
+      id_transacao: pagamento.id_transacao || "",
+      assunto_email: meta.assunto_email || "",
+      remetente: meta.remetente || "",
+      message_id: String(meta.message_id || ""),
+      source_kind: meta.source_kind || "pdf_extrato",
+      attachment_name: meta.attachment_name || "",
+      status: "pendente_associacao",
+      erro: planoInfo.motivo || "Plano de contas não resolvido"
+    });
+    return;
+  }
+
+  const dupGC = payExisteDuplicataGCPagamento_(
+    planoInfo.plano_contas,
+    pagamento,
+    PAY_ITAU_CONTA_OFICIAL
+  );
+
+  if (dupGC.ok && dupGC.duplicado) {
+    state.duplicados.push({
+      id_local: "D" + state.seqDup++,
+      motivo: "duplicado_gc",
+      nome_extraido: pagamento.nome_favorecido || "",
+      descricao_extraida: pagamento.descricao_pagamento || "",
+      plano_contas: planoInfo.plano_contas,
+      data_pagamento: pagamento.data_pagamento,
+      valor: pagamento.valor,
+      assunto_email: meta.assunto_email || "",
+      remetente: meta.remetente || "",
+      message_id: String(meta.message_id || ""),
+      id_transacao: pagamento.id_transacao || "",
+      banco_extraido: pagamento.banco_email || "",
+      gc_pagamento_id: dupGC.pagamento_id || null,
+      gc_pagamento_codigo: dupGC.pagamento_codigo || null,
+      source_kind: meta.source_kind || "pdf_extrato",
+      attachment_name: meta.attachment_name || ""
+    });
+    return;
+  }
+
+  if (dupGC.ok && dupGC.ambiguo) {
+    state.pendencias_associacao.push({
+      id_local: "P" + state.seqPend++,
+      nome_extraido: pagamento.nome_favorecido || pagamento.descricao_pagamento || "",
+      descricao_extraida: pagamento.descricao_pagamento || "",
+      plano_sugerido: planoInfo.plano_contas,
+      data_pagamento: pagamento.data_pagamento,
+      data_compensacao: pagamento.data_pagamento,
+      vencimento: pagamento.data_pagamento,
+      valor: pagamento.valor,
+      forma: PAY_FORMA_PADRAO,
+      conta_oficial: PAY_ITAU_CONTA_OFICIAL,
+      banco_extraido: pagamento.banco_email || "",
+      cpf_cnpj: pagamento.cpf_cnpj || "",
+      id_transacao: pagamento.id_transacao || "",
+      assunto_email: meta.assunto_email || "",
+      remetente: meta.remetente || "",
+      message_id: String(meta.message_id || ""),
+      source_kind: meta.source_kind || "pdf_extrato",
+      attachment_name: meta.attachment_name || "",
+      status: "pendente_gc_ambiguo",
+      erro: "Ambiguidade no GC: múltiplos pagamentos iguais para mesma data/valor/conta.",
+      gc_ambiguo: true,
+      gc_matches: dupGC.matches || []
+    });
+    return;
+  }
+
+  state.itens_prontos.push({
+    id_local: "I" + state.seqPronto++,
+    plano_contas: planoInfo.plano_contas,
+    descricao_pagamento: planoInfo.plano_contas,
+    nome_extraido: pagamento.nome_favorecido || pagamento.descricao_pagamento || "",
+    descricao_extraida: pagamento.descricao_pagamento || "",
+    data_pagamento: pagamento.data_pagamento,
+    data_compensacao: pagamento.data_pagamento,
+    vencimento: pagamento.data_pagamento,
+    valor: pagamento.valor,
+    forma: PAY_FORMA_PADRAO,
+    conta_oficial: PAY_ITAU_CONTA_OFICIAL,
+    quitado: PAY_QUITADO_PADRAO,
+    banco_extraido: pagamento.banco_email || "",
+    cpf_cnpj: pagamento.cpf_cnpj || "",
+    id_transacao: pagamento.id_transacao || "",
+    assunto_email: meta.assunto_email || "",
+    remetente: meta.remetente || "",
+    message_id: String(meta.message_id || ""),
+    source_kind: meta.source_kind || "pdf_extrato",
+    attachment_name: meta.attachment_name || "",
+    status: "pronto"
+  });
+}
+
+function preVisualizarPagamentosItau_(periodo, telegram, meta) {
+  garantirMapaPagamentosSheet_();
+
+  const docJson = (telegram && telegram.document_json) || null;
+  const banco = String((docJson && docJson.banco) || "").toLowerCase().trim();
+  const extratoDetectado = !!(docJson && docJson.extrato_detectado);
+
+  if (!docJson) {
+    return {
+      ok: false,
+      message: "Não recebi o JSON estruturado do PDF do Itaú."
+    };
+  }
+
+  if (!extratoDetectado) {
+    return {
+      ok: false,
+      message: "A IA não confirmou que o arquivo é um extrato bancário válido."
+    };
+  }
+
+  if (banco && banco !== "itau") {
+    return {
+      ok: false,
+      message: 'O arquivo analisado não foi identificado como extrato Itaú. Banco detectado: "' + banco + '"'
+    };
+  }
+
+  const lancamentos = Array.isArray(docJson.lancamentos)
+    ? docJson.lancamentos.map(normalizarLancamentoItauJson_)
+    : [];
+  const pagamentos = payFiltrarLancamentosItauPagamentos_(lancamentos);
+  const pagamentosNoPeriodo = filtrarLancamentosItauPorPeriodo_(pagamentos, periodo);
+
+  const itens_prontos = [];
+  const pendencias_associacao = [];
+  const ignorados = [];
+  const duplicados = [];
+  const ja_processados = [];
+  const state = {
+    itens_prontos: itens_prontos,
+    pendencias_associacao: pendencias_associacao,
+    ignorados: ignorados,
+    duplicados: duplicados,
+    seqPronto: 1,
+    seqPend: 1,
+    seqDup: 1
+  };
+
+  for (let i = 0; i < pagamentosNoPeriodo.length; i++) {
+    try {
+      payProcessarPagamentoItauParaPrevia_(state, pagamentosNoPeriodo[i], {
+        assunto_email: "Extrato Itaú PDF",
+        remetente: "Telegram PDF",
+        message_id: String((meta && meta.message_id) || ""),
+        attachment_name: String((telegram && telegram.document_file_name) || ""),
+        source_kind: "pdf_extrato"
+      });
+    } catch (e) {
+      pendencias_associacao.push({
+        id_local: "P" + state.seqPend++,
+        nome_extraido: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].nome_pagador) || "").trim(),
+        descricao_extraida: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].linha_resumo) || "").trim(),
+        data_pagamento: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].data_pagamento) || "").trim(),
+        data_compensacao: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].data_pagamento) || "").trim(),
+        vencimento: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].data_pagamento) || "").trim(),
+        valor: pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].valor != null ? Number(pagamentosNoPeriodo[i].valor) : null,
+        forma: PAY_FORMA_PADRAO,
+        conta_oficial: PAY_ITAU_CONTA_OFICIAL,
+        banco_extraido: PAY_ITAU_CONTA_OFICIAL,
+        cpf_cnpj: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].cpf_cnpj) || "").trim(),
+        id_transacao: String((pagamentosNoPeriodo[i] && pagamentosNoPeriodo[i].id_transacao) || "").trim(),
+        assunto_email: "Extrato Itaú PDF",
+        remetente: "Telegram PDF",
+        message_id: String((meta && meta.message_id) || ""),
+        source_kind: "pdf_extrato",
+        attachment_name: String((telegram && telegram.document_file_name) || ""),
+        status: "pendente_associacao",
+        erro: String(e)
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    modo: "pre_visualizacao",
+    tipo_fluxo: "pagamentos",
+    origem: "itau",
+    fonte_dados: "telegram_pdf_itau",
+    attachment_name: String((telegram && telegram.document_file_name) || ""),
+    observacoes_extrato: String((docJson && docJson.observacoes) || ""),
+    periodo: normalizarPeriodoRetornoItau_(periodo),
+    itens_prontos: itens_prontos,
+    pendencias_associacao: pendencias_associacao,
+    ignorados: ignorados,
+    duplicados: duplicados,
+    ja_processados: ja_processados,
+    message: pagamentosNoPeriodo.length
+      ? "Pré-visualização do lote de pagamentos gerada a partir do extrato PDF do Itaú."
+      : "Extrato PDF do Itaú encontrado, mas sem pagamentos válidos no período informado."
   };
 }
 
@@ -2090,10 +2392,10 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
 
 function associarPendenciaPagamentos_(payload) {
   const origem = String(payload.origem || "").toLowerCase().trim();
-  if (origem !== "inter") {
+  if (["inter", "itau"].indexOf(origem) < 0) {
     return {
       ok: false,
-      message: "Pagamentos Itaú ainda não foram implementados nesta primeira fase."
+      message: 'Origem inválida. Use "inter" ou "itau".'
     };
   }
 
@@ -2112,10 +2414,10 @@ function associarPendenciaPagamentos_(payload) {
 
 function confirmarLotePagamentos_(payload) {
   const origem = String(payload.origem || "").toLowerCase().trim();
-  if (origem !== "inter") {
+  if (["inter", "itau"].indexOf(origem) < 0) {
     return {
       ok: false,
-      message: "Pagamentos Itaú ainda não foram implementados nesta primeira fase."
+      message: 'Origem inválida. Use "inter" ou "itau".'
     };
   }
 
@@ -2320,7 +2622,8 @@ function confirmarLotePagamentosInter_(payload) {
     duplicadosGC,
     ambiguosGC,
     forcados,
-    erros
+    erros,
+    payload && payload.origem
   );
 }
 
@@ -3054,10 +3357,15 @@ function payMontarResumoConfirmacao_(
   duplicadosGC,
   ambiguosGC,
   forcados,
-  erros
+  erros,
+  origem
 ) {
   const linhas = [];
-  linhas.push("Lote de pagamentos confirmado (INTER).");
+  linhas.push(
+    "Lote de pagamentos confirmado (" +
+    String(origem || "inter").toUpperCase() +
+    ")."
+  );
   linhas.push("");
   linhas.push("Processados: " + processados);
   linhas.push("Duplicados no LOG: " + duplicadosLog);

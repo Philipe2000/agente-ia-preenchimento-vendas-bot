@@ -262,7 +262,7 @@ async function extrairRecebimentosItauDoPdfComIA(pdfBuffer, filename = "extrato_
     throw new Error("OPENAI_API_KEY não configurada.");
   }
 
-  const model = process.env.OPENAI_ITAU_PDF_MODEL || "gpt-4.1-mini";
+  const model = process.env.OPENAI_ITAU_PDF_MODEL || "gpt-5";
   const base64Pdf = pdfBuffer.toString("base64");
   const dataUrl = `data:application/pdf;base64,${base64Pdf}`;
 
@@ -302,17 +302,22 @@ async function extrairRecebimentosItauDoPdfComIA(pdfBuffer, filename = "extrato_
 
   const instructions = [
     "Analise este PDF de extrato bancário.",
-    "Seu trabalho é identificar se o documento é um extrato do Itaú e extrair apenas recebimentos PIX.",
+    "Seu trabalho é identificar se o documento é um extrato do Itaú e extrair os principais lançamentos de entrada e saída úteis para automação.",
     "",
     "Regras obrigatórias:",
     "- Retorne SOMENTE JSON válido no schema pedido.",
     "- banco deve ser 'itau' se o extrato for do Itaú; caso contrário, use 'desconhecido'.",
     "- extrato_detectado = true somente se realmente for extrato bancário.",
-    "- Inclua em lancamentos APENAS linhas de PIX RECEBIDO / recebimento PIX.",
-    "- Ignore PIX enviado, saldo, rendimento, pagamento QR code, depósito em dinheiro e outras movimentações que não sejam recebimento PIX.",
+    "- Inclua em lancamentos apenas movimentações relevantes para recebimentos e pagamentos.",
+    "- Tipos válidos para `tipo`: 'pix_recebido', 'pix_enviado', 'pix_qrcode', 'debito_compra'.",
+    "- Use 'pix_recebido' para entradas PIX.",
+    "- Use 'pix_enviado' para transferências/pagamentos PIX de saída.",
+    "- Use 'pix_qrcode' para pagamento via PIX QR-Code quando isso estiver claro.",
+    "- Use 'debito_compra' para compra em débito/cartão/débito em conta quando o extrato indicar gasto/pagamento de saída.",
+    "- Ignore saldo, rendimento, depósito em dinheiro, tarifas irrelevantes, cabeçalhos e linhas sem valor claro.",
     "- data_pagamento deve vir em formato ISO YYYY-MM-DD quando possível.",
     "- valor deve ser número decimal, sem símbolo.",
-    "- nome_pagador deve ser o melhor nome possível da pessoa/empresa que pagou.",
+    "- nome_pagador deve ser o melhor nome possível da contraparte, favorecido ou estabelecimento.",
     "- cpf_cnpj pode ser null se não estiver claro.",
     "- linha_resumo deve guardar um resumo curto da linha/origem do extrato.",
     "",
@@ -321,12 +326,18 @@ async function extrairRecebimentosItauDoPdfComIA(pdfBuffer, filename = "extrato_
     "- Se houver ruído na tabela, ainda assim tente reconstruir os lançamentos.",
     "- Se houver dúvida, prefira incluir menos itens do que inventar.",
     "",
-    "Exemplo de tipo válido:",
-    "- tipo: 'pix_recebido'"
+    "Exemplos de tipos válidos:",
+    "- tipo: 'pix_recebido'",
+    "- tipo: 'pix_enviado'",
+    "- tipo: 'pix_qrcode'",
+    "- tipo: 'debito_compra'"
   ].join("\n");
 
   const payload = {
     model,
+    reasoning: {
+      effort: "medium"
+    },
     input: [
       {
         role: "user",
@@ -408,7 +419,7 @@ function normalizarExtracaoItauIA(parsed) {
   const lancamentos = Array.isArray(parsed?.lancamentos)
     ? parsed.lancamentos
         .map((item) => ({
-          tipo: String(item?.tipo || "").trim().toLowerCase(),
+          tipo: normalizarTipoLancamentoItauIA(item?.tipo),
           data_pagamento: normalizarDataIsoIA(item?.data_pagamento),
           nome_pagador: item?.nome_pagador == null ? "" : String(item.nome_pagador).trim(),
           cpf_cnpj: item?.cpf_cnpj == null ? "" : String(item.cpf_cnpj).trim(),
@@ -417,7 +428,7 @@ function normalizarExtracaoItauIA(parsed) {
         }))
         .filter(
           (item) =>
-            item.tipo === "pix_recebido" &&
+            ["pix_recebido", "pix_enviado", "debito_compra"].includes(item.tipo) &&
             item.data_pagamento &&
             Number.isFinite(item.valor) &&
             item.valor > 0
@@ -430,6 +441,72 @@ function normalizarExtracaoItauIA(parsed) {
     observacoes,
     lancamentos
   };
+}
+
+function normalizarTipoLancamentoItauIA(value) {
+  const tipo = String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  if (!tipo) return "";
+
+  if (
+    [
+      "pix_recebido",
+      "pix recebido",
+      "recebimento pix",
+      "pix de entrada"
+    ].includes(tipo)
+  ) {
+    return "pix_recebido";
+  }
+
+  if (
+    [
+      "pix_qrcode",
+      "pix qrcode",
+      "pix qr-code",
+      "pix qr code",
+      "pagamento qr code",
+      "pagamento pix qr code",
+      "pix via qr code"
+    ].includes(tipo)
+  ) {
+    return "pix_enviado";
+  }
+
+  if (
+    [
+      "pix_enviado",
+      "pix enviado",
+      "pagamento pix",
+      "transferencia pix",
+      "transferência pix",
+      "pix de saida",
+      "pix de saída"
+    ].includes(tipo)
+  ) {
+    return "pix_enviado";
+  }
+
+  if (
+    [
+      "debito_compra",
+      "compra no debito",
+      "compra no debito:",
+      "compra debito",
+      "debito compra",
+      "compra em debito",
+      "compra em débito",
+      "debito"
+    ].includes(tipo)
+  ) {
+    return "debito_compra";
+  }
+
+  return tipo;
 }
 
 function normalizarDataIsoIA(value) {
@@ -1633,19 +1710,128 @@ async function tryHandlePagamentosPendingCommands(chatId, text) {
 }
 
 async function handlePagamentosMessage(ctx) {
-  const { message, text, sendTelegramMessage, transcription } = ctx;
+  const {
+    message,
+    text,
+    sendTelegramMessage,
+    transcription,
+    documentText = "",
+    documentJson = null,
+    documentFileName = ""
+  } = ctx;
   const chatId = message.chat.id;
   const parsed = parsePagamentosIntent(text, message);
+  const lastPdf = getUsableLastPdfContext(chatId);
+  const textoNormalizado = normalizeText(text);
+  const origemExplicita =
+    textoNormalizado.includes("inter") ||
+    textoNormalizado.includes("itau") ||
+    textoNormalizado.includes("itaú");
+
+  if (!origemExplicita && !documentJson && lastPdf?.origem === "itau" && lastPdf?.documentJson) {
+    parsed.origem = "itau";
+  }
 
   if (transcription) {
     await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
   }
 
   if (parsed.origem === "itau") {
+    const pdfCtx = documentJson
+      ? {
+          documentText,
+          documentJson,
+          fileName: documentFileName || message?.document?.file_name || ""
+        }
+      : lastPdf?.origem === "itau"
+      ? {
+          documentText: lastPdf?.documentText || "",
+          documentJson: lastPdf?.documentJson || null,
+          fileName: lastPdf?.file_name || ""
+        }
+      : null;
+
+    if (!pdfCtx?.documentJson) {
+      await sendTelegramMessage(
+        chatId,
+        "Recebi seu comando de pagamentos Itaú, mas ainda não tenho um PDF do Itaú pronto para usar. Envie primeiro o PDF do extrato e depois repita o comando."
+      );
+      return;
+    }
+
     await sendTelegramMessage(
       chatId,
-      "Pagamentos Itaú ainda não estão implementados nesta primeira fase. Vou seguir primeiro com pagamentos do Inter."
+      `Entendi. Vou processar pagamentos de ITAÚ para ${parsed.periodo.label}.`
     );
+
+    await sendTelegramMessage(
+      chatId,
+      "Montando a prévia dos pagamentos, aguarde um instante..."
+    );
+
+    const result = await callPagamentosWebApp({
+      action: "processar_pagamentos_v1",
+      origem: parsed.origem,
+      periodo: parsed.periodo,
+      telegram: {
+        chat_id: chatId,
+        document_text: pdfCtx.documentText || "",
+        document_json: pdfCtx.documentJson || null,
+        document_file_name: pdfCtx.fileName || ""
+      },
+      message_meta: {
+        message_id: message.message_id || null,
+        date: message.date || null
+      }
+    });
+
+    console.log("Pagamentos result:", JSON.stringify(result));
+
+    if (result?.modo === "pre_visualizacao") {
+      const duplicadosComId = (result.duplicados || []).map((d, idx) => ({
+        ...d,
+        id_local: `D${idx + 1}`
+      }));
+
+      const lote = {
+        tipo: "pagamentos_lote_pendente",
+        origem: result.origem || parsed.origem,
+        fonte_dados: result.fonte_dados || "",
+        attachment_name: result.attachment_name || "",
+        mensagem_origem: result.message || "",
+        observacoes_extrato: result.observacoes_extrato || "",
+        periodo: result.periodo || parsed.periodo,
+        criadoEm: new Date().toISOString(),
+        resumoOrigem: {
+          processados_detectados: (result.itens_prontos || []).length,
+          ignorados: (result.ignorados || []).length,
+          duplicados: duplicadosComId.length,
+          ja_processados: (result.ja_processados || []).length,
+          erros: (result.pendencias_associacao || []).length
+        },
+        itens_prontos: result.itens_prontos || [],
+        pendencias_associacao: result.pendencias_associacao || [],
+        ignorados: result.ignorados || [],
+        duplicados: duplicadosComId,
+        ja_processados: result.ja_processados || [],
+        historico_comandos: []
+      };
+
+      savePendingPagamentos(chatId, lote);
+      await sendTelegramMessage(chatId, summarizePendingPagamentos(lote));
+      return;
+    }
+
+    if (!result?.ok && result?.modo !== "pre_visualizacao") {
+      await sendTelegramMessage(
+        chatId,
+        result?.message || result?.error || "Não consegui processar os pagamentos."
+      );
+      return;
+    }
+
+    const resumo = result?.message || "Pagamentos processados.";
+    await sendTelegramMessage(chatId, resumo);
     return;
   }
 
@@ -2389,7 +2575,8 @@ app.post("/telegram/webhook", async (req, res) => {
     // DOCUMENTO / PDF
     // =====================================================
     if (msg.document) {
-      const explicitIntentInCaption = !!text && isRecebimentosIntent(text, msg);
+      const explicitRecebimentosIntentInCaption = !!text && isRecebimentosIntent(text, msg);
+      const explicitPagamentosIntentInCaption = !!text && isPagamentosIntent(text, msg);
 
       if (!looksLikePdfDocument(msg)) {
         await sendTelegramMessage(
@@ -2435,11 +2622,11 @@ app.post("/telegram/webhook", async (req, res) => {
           documentJson
         });
 
-        if (!explicitIntentInCaption) {
+        if (!explicitRecebimentosIntentInCaption && !explicitPagamentosIntentInCaption) {
           if (documentJson?.extrato_detectado) {
             await sendTelegramMessage(
               chatId,
-              "Recebi o PDF do Itaú e já deixei tudo pronto. Agora me diga o período, por exemplo:\n- preencher recebimentos Itaú hoje\n- preencher recebimentos Itaú últimos 7 dias"
+              "Recebi o PDF do Itaú e já deixei tudo pronto. Agora me diga o período, por exemplo:\n- preencher recebimentos Itaú hoje\n- preencher pagamentos Itaú hoje\n- preencher pagamentos Itaú últimos 7 dias"
             );
           } else {
             await sendTelegramMessage(
@@ -2455,22 +2642,33 @@ app.post("/telegram/webhook", async (req, res) => {
           msg.document.file_name || "extrato_itau.pdf"
         );
 
-        await handleRecebimentosMessage({
-          message: syntheticMsg,
-          text,
-          sendTelegramMessage,
-          documentText,
-          documentJson
-        });
+        if (explicitPagamentosIntentInCaption) {
+          await handlePagamentosMessage({
+            message: syntheticMsg,
+            text,
+            sendTelegramMessage,
+            documentText,
+            documentJson,
+            documentFileName: msg.document.file_name || "extrato_itau.pdf"
+          });
+        } else {
+          await handleRecebimentosMessage({
+            message: syntheticMsg,
+            text,
+            sendTelegramMessage,
+            documentText,
+            documentJson
+          });
+        }
         return;
       }
 
-      const isReceb = explicitIntentInCaption || isRecebimentosIntent(text, msg);
+      const isReceb = explicitRecebimentosIntentInCaption || isRecebimentosIntent(text, msg);
 
       if (!isReceb) {
         await sendTelegramMessage(
           chatId,
-          "Recebi um PDF. Se isso for um extrato de recebimentos, me diga algo como: 'preencher recebimentos últimos 7 dias'."
+          "Recebi um PDF. Se isso for um extrato, me diga algo como:\n- preencher recebimentos Itaú últimos 7 dias\n- preencher pagamentos Itaú hoje"
         );
         return;
       }
