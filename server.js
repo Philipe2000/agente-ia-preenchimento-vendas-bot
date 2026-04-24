@@ -1256,6 +1256,15 @@ function summarizePendingPagamentos(lote) {
   const linhas = [];
   linhas.push(`Pagamentos ${String(lote?.origem || "").toUpperCase()} encontrados.`);
   linhas.push("");
+  if (lote?.fonte_dados) {
+    linhas.push(`Fonte: ${String(lote.fonte_dados)}`);
+  }
+  if (lote?.attachment_name) {
+    linhas.push(`Extrato: ${String(lote.attachment_name)}`);
+  }
+  if (lote?.mensagem_origem) {
+    linhas.push(`Observação: ${String(lote.mensagem_origem)}`);
+  }
   linhas.push(`Período: ${lote?.periodo?.label || "não informado"}`);
   linhas.push(`Prontos para preencher: ${prontos.length}`);
   linhas.push(`Pendências: ${pendencias.length}`);
@@ -1638,6 +1647,9 @@ async function handlePagamentosMessage(ctx) {
     const lote = {
       tipo: "pagamentos_lote_pendente",
       origem: result.origem || parsed.origem,
+      fonte_dados: result.fonte_dados || "",
+      attachment_name: result.attachment_name || "",
+      mensagem_origem: result.message || "",
       periodo: result.periodo || parsed.periodo,
       criadoEm: new Date().toISOString(),
       resumoOrigem: {

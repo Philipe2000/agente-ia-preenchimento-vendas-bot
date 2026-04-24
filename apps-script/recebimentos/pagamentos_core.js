@@ -23,7 +23,7 @@ const PAY_ROW_START = 93;
 const PAY_ROW_END = 120;
 const PAY_STEP = 3;
 
-const PAY_INTER_OPENAI_MODEL = "gpt-4.1-mini";
+const PAY_INTER_OPENAI_MODEL = "gpt-4.1";
 const PAY_LOG_FOLDER_ID = INTER_DRIVE_FOLDER_ID_LOG;
 
 const PAY_ENDPOINT_PLANOS_1 = "/api/planos_contas";
@@ -40,7 +40,8 @@ const PAY_GMAIL_LABEL_DUPLICADO = "pay-duplicado";
 const PAY_GMAIL_LABEL_ERRO = "pay-erro";
 const PAY_GMAIL_LABEL_IGNORADO = "pay-ignorado";
 const PAY_GMAIL_QUERY_EXTRATO_INTER = "from:no-reply@inter.co has:attachment newer_than:180d";
-const PAY_EXTRATO_CACHE_PREFIX = "PAYINTER_EXTRATO_PARSE__";
+const PAY_EXTRATO_CACHE_PREFIX = "PAYINTER_EXTRATO_PARSE_V2__";
+const PAY_EXTRATO_CACHE_TYPE = "inter_pdf_pagamentos_periodo_v2";
 const PAY_INTER_EXTRATO_DRIVE_FOLDER_ID = "1oJCd0cfQeU5Z5v0UaYvI1Cjr9H7psagD";
 
 const PAY_IGNORE_NAMES = [
@@ -1041,12 +1042,12 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
   );
 
   let parsed = payLerRegistroDrive_(cacheFileName);
-  if (!parsed || parsed.cache_type !== "inter_pdf_pagamentos_periodo") {
+  if (!parsed || parsed.cache_type !== PAY_EXTRATO_CACHE_TYPE) {
     parsed = payAnalisarExtratoInterPdfComOpenAI_(
       candidato.attachment,
       payMontarJanelaDatasPorPeriodo_(periodo)
     );
-    parsed.cache_type = "inter_pdf_pagamentos_periodo";
+    parsed.cache_type = PAY_EXTRATO_CACHE_TYPE;
     parsed.cached_at = new Date().toISOString();
     payGravarRegistroNoDrive_(cacheFileName, parsed);
   }
@@ -1064,7 +1065,8 @@ function payObterPagamentosDoMelhorExtratoInter_(periodo) {
     extrato_detectado: !!parsed.extrato_detectado,
     banco: parsed.banco || "Inter",
     observacoes: parsed.observacoes || "",
-    origem_extrato: candidatosDrive.length ? "drive_folder_pdf" : "gmail_pdf"
+    origem_extrato: candidatosDrive.length ? "drive_folder_pdf" : "gmail_pdf",
+    source_candidate_found: true
   };
 }
 
@@ -1636,6 +1638,7 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
       duplicados: duplicados,
       ja_processados: ja_processados,
       attachment_name: extrato.attachment_name || "",
+      observacoes_extrato: extrato.observacoes || "",
       message: extrato.pagamentos.length
         ? "Pré-visualização do lote de pagamentos gerada a partir do extrato PDF do Inter."
         : "Extrato PDF do Inter encontrado, mas sem pagamentos válidos no período informado."
@@ -1771,7 +1774,11 @@ function preVisualizarPagamentosInter_(periodo, telegram, meta) {
     ignorados: ignorados,
     duplicados: duplicados,
     ja_processados: ja_processados,
-    message: "Pré-visualização do lote de pagamentos gerada com sucesso."
+    attachment_name: extrato.attachment_name || "",
+    observacoes_extrato: extrato.observacoes || "",
+    message: extrato && extrato.encontrado
+      ? "Usei o fallback de e-mails porque não consegui interpretar corretamente o extrato PDF do Inter."
+      : "Pré-visualização do lote de pagamentos gerada com sucesso."
   };
 }
 
