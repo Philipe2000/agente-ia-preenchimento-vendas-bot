@@ -2179,6 +2179,24 @@ function parseCompraNumber(value) {
   return Number.isFinite(n) ? n : NaN;
 }
 
+function normalizeCompraUnit(value) {
+  const t = normalizeText(value);
+  if (!t) return "un";
+  if (["kg", "quilo", "quilos", "kilograma", "kilogramas"].includes(t)) return "kg";
+  if (["g", "gr", "grama", "gramas"].includes(t)) return "g";
+  return "un";
+}
+
+function convertCompraQuantityToKg(quantity, unit) {
+  const n = Number(quantity);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  const normalizedUnit = normalizeCompraUnit(unit);
+  if (normalizedUnit === "g") {
+    return Number((n / 1000).toFixed(3));
+  }
+  return n;
+}
+
 function formatCompraQuantidade(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "?";
@@ -2210,10 +2228,14 @@ function normalizeCompraExtraction(raw = {}) {
     itens: itens
       .map((item, idx) => {
         const quantidade = parseCompraNumber(item?.quantidade);
+        const unidadeNormalizada = normalizeCompraUnit(item?.unidade);
         const precoUnitario = parseCompraNumber(item?.preco_unitario_falado);
         const valorTotal = parseCompraNumber(item?.valor_total_falado);
 
-        let quantidadeFinal = Number.isFinite(quantidade) && quantidade > 0 ? quantidade : 1;
+        let quantidadeFinal = convertCompraQuantityToKg(
+          Number.isFinite(quantidade) && quantidade > 0 ? quantidade : 1,
+          unidadeNormalizada
+        );
         let precoUnitarioFinal = Number.isFinite(precoUnitario) && precoUnitario > 0 ? precoUnitario : NaN;
 
         if ((!Number.isFinite(precoUnitarioFinal) || precoUnitarioFinal <= 0) &&
@@ -2225,7 +2247,8 @@ function normalizeCompraExtraction(raw = {}) {
           id_local: `C${idx + 1}`,
           produto_falado: String(item?.produto_falado || "").trim(),
           quantidade: quantidadeFinal,
-          unidade: String(item?.unidade || "un").trim() || "un",
+          unidade: "kg",
+          unidade_original: unidadeNormalizada,
           preco_unitario_falado:
             Number.isFinite(precoUnitarioFinal) && precoUnitarioFinal > 0
               ? Number(precoUnitarioFinal.toFixed(2))
@@ -2490,7 +2513,7 @@ function summarizePendingCompras(lote) {
     linhas.push("", "Prontos:");
     prontos.forEach((item) => {
       linhas.push(
-        `${item.id_local}. ${item.produto_oficial || item.produto_falado || "?"} | qtd ${formatCompraQuantidade(item.quantidade)} | unit ${formatMoneyBRL(item.valor_unitario)} | total ${formatMoneyBRL(item.valor_total)}`
+        `${item.id_local}. ${item.produto_oficial || item.produto_falado || "?"} | qtd ${formatCompraQuantidade(item.quantidade)}kg | unit ${formatMoneyBRL(item.valor_unitario)} | total ${formatMoneyBRL(item.valor_total)}`
       );
     });
   }
@@ -2499,7 +2522,7 @@ function summarizePendingCompras(lote) {
     linhas.push("", "Pendências:");
     pendencias.forEach((item) => {
       linhas.push(
-        `${item.id_local}. ${item.produto_oficial || item.produto_falado || "?"} | qtd ${formatCompraQuantidade(item.quantidade)} | ${item.erro || "pendência"}`
+        `${item.id_local}. ${item.produto_oficial || item.produto_falado || "?"} | qtd ${formatCompraQuantidade(item.quantidade)}kg | ${item.erro || "pendência"}`
       );
     });
   }

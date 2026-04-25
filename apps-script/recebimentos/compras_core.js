@@ -10,6 +10,18 @@ const COMPRA_DEFAULTS_ = {
   conta_bancaria: "Itau"
 };
 
+function comprasGetSpreadsheet_() {
+  if (typeof RECEB_PLANILHA_ID !== "undefined" && RECEB_PLANILHA_ID) {
+    return SpreadsheetApp.openById(RECEB_PLANILHA_ID);
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error("Planilha Central de Controle API não encontrada no contexto atual.");
+  }
+  return ss;
+}
+
 function comprasNorm_(s) {
   return String(s || "")
     .replace(/\s+/g, " ")
@@ -178,7 +190,7 @@ function comprasDefaultPriceSeeds_() {
 }
 
 function garantirInfraCompras_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = comprasGetSpreadsheet_();
   let sh = ss.getSheetByName(MAPA_COMPRAS_SHEET_NAME_);
 
   if (!sh) {
@@ -271,7 +283,7 @@ function garantirInfraCompras_() {
 function comprasMapaRows_() {
   garantirInfraCompras_();
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = comprasGetSpreadsheet_();
   const sh = ss.getSheetByName(MAPA_COMPRAS_SHEET_NAME_);
   const lastRow = sh.getLastRow();
   if (lastRow <= 1) return [];
@@ -301,7 +313,7 @@ function comprasSalvarPrecoMapa_(produtoOficial, preco, origem) {
   });
   if (!row) return false;
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = comprasGetSpreadsheet_();
   const sh = ss.getSheetByName(MAPA_COMPRAS_SHEET_NAME_);
   sh.getRange(row.rowNumber, 3).setValue(Number(preco));
   sh.getRange(row.rowNumber, 4).setValue(String(origem || "manual"));
@@ -511,7 +523,7 @@ function resolverProdutoCompraAction_(payload) {
 }
 
 function encontrarBlocoLivreCompras_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = comprasGetSpreadsheet_();
   const sh = ss.getSheetByName(COMPRAS_SHEET_NAME_) || ss.getActiveSheet();
 
   for (let i = 0; i < COMPRAS_BASE_ROWS_.length; i++) {
