@@ -10,8 +10,13 @@ const {
   isPagamentosIntent,
   parsePagamentosIntent
 } = require("./intents_pagamentos");
+const {
+  isComprasIntent,
+  parseComprasIntent
+} = require("./intents_compras");
 const { callRecebimentosWebApp } = require("./appscript_recebimentos");
 const { callPagamentosWebApp } = require("./appscript_pagamentos");
+const { callComprasWebApp } = require("./appscript_compras");
 const { callVendasWebApp } = require("./appscript_vendas");
 
 const app = express();
@@ -31,6 +36,7 @@ const OPENAI_TRANSCRIBE_MODEL =
 const pendingBatches = new Map(); // vendas
 const pendingRecebimentos = new Map(); // recebimentos
 const pendingPagamentos = new Map(); // pagamentos
+const pendingCompras = new Map(); // compras
 const lastPdfContextByChat = new Map();
 const activePdfProcessingByChat = new Map();
 const queuedItauCommandsByChat = new Map();
@@ -62,6 +68,18 @@ function getPendingPagamentos(chatId) {
 
 function clearPendingPagamentos(chatId) {
   pendingPagamentos.delete(String(chatId));
+}
+
+function savePendingCompras(chatId, lote) {
+  pendingCompras.set(String(chatId), lote);
+}
+
+function getPendingCompras(chatId) {
+  return pendingCompras.get(String(chatId)) || null;
+}
+
+function clearPendingCompras(chatId) {
+  pendingCompras.delete(String(chatId));
 }
 
 function saveLastPdfContext(chatId, ctx) {
@@ -235,6 +253,15 @@ function looksLikePdfDocument(message = {}) {
   return mime === "application/pdf" || name.endsWith(".pdf");
 }
 
+function looksLikeImageDocument(message = {}) {
+  const name = String(message?.document?.file_name || "").toLowerCase();
+  const mime = String(message?.document?.mime_type || "").toLowerCase();
+  return (
+    mime.startsWith("image/") ||
+    [".png", ".jpg", ".jpeg", ".webp", ".heic"].some((ext) => name.endsWith(ext))
+  );
+}
+
 function looksLikeItauStatement(text) {
   const t = normalizeText(text);
   return (
@@ -281,6 +308,23 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "preencha recebimentos de hoje",
       "preencha recebimentos dos ultimos 7 dias",
       "preencha recebimentos dia 18/04, 19/04, 20/04",
+      "Comandos frequentes de pagamentos:",
+      "preencher pagamentos inter hoje",
+      "preencher pagamentos itau 20/04",
+      "confirmar lote",
+      "cancelar lote",
+      "Comandos frequentes de compras:",
+      "preencher compras",
+      "confirmar compras",
+      "produto C1 cabelo castanho liga rosa 60/65cm",
+      "preco C1 2290",
+      "qtd C1 2",
+      "fornecedor CH - SP",
+      "situacao Em Sao Paulo",
+      "conta Itau",
+      "quitar sim",
+      "emissao hoje",
+      "vencimento hoje",
       "associar P1 Diergia",
       "associar Karolaine a Ricardo",
       "liberar duplicata D1",
@@ -288,7 +332,7 @@ async function transcribeAudioWithOpenAI(buffer, filename = "audio.ogg") {
       "cancelar lote",
       "remover 5",
       "Datas podem aparecer como 18/04, 18-04, 19/04, 20/04.",
-      "Se houver código como P1, P2, I1, I2, D1, D2, preserve exatamente.",
+      "Se houver código como P1, P2, I1, I2, C1, C2, D1, D2, preserve exatamente.",
       "Se houver valor monetário, preserve os números com máxima fidelidade.",
       "Nomes frequentes de clientes e pessoas:",
       "Diergia, Ricardo, Sandro, Larissa, Raquel, Renata, Flávio, Fábio, Diege, Dieergia, Karolaine, Philipe, Izabel, Samara, Eliete, Edilene, Lidiane, Manu."
@@ -2050,6 +2094,957 @@ async function handlePagamentosMessage(ctx) {
 
 /**
  * =========================================================
+ * COMPRAS - HELPERS
+ * =========================================================
+ */
+const COMPRA_DEFAULTS = Object.freeze({
+  fornecedor: "CH - SP",
+  situacao: "Em São Paulo",
+  quitar_pagamento: "Sim",
+  conta_bancaria: "Itau"
+});
+
+function getTodayIsoFortaleza() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Fortaleza",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+
+  const year = parts.find((p) => p.type === "year")?.value || "0000";
+  const month = parts.find((p) => p.type === "month")?.value || "00";
+  const day = parts.find((p) => p.type === "day")?.value || "00";
+  return `${year}-${month}-${day}`;
+}
+
+function getCurrentYearFortaleza() {
+  return Number(String(getTodayIsoFortaleza()).slice(0, 4)) || new Date().getFullYear();
+}
+
+function formatIsoDateBr(value) {
+  const iso = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return String(value || "");
+  return `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
+}
+
+function parseCompraDateToIso(value, fallbackIso = getTodayIsoFortaleza()) {
+  const raw = String(value || "").trim();
+  if (!raw) return fallbackIso;
+
+  const t = normalizeText(raw);
+  if (t === "hoje") return getTodayIsoFortaleza();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return raw;
+  }
+
+  let m = raw.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
+  if (!m) {
+    m = raw.match(/^(\d{1,2})-(\d{1,2})(?:-(\d{4}))?$/);
+  }
+
+  if (m) {
+    const day = String(m[1]).padStart(2, "0");
+    const month = String(m[2]).padStart(2, "0");
+    const year = String(m[3] || getCurrentYearFortaleza());
+    return `${year}-${month}-${day}`;
+  }
+
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    const yyyy = parsed.getFullYear();
+    const mm = String(parsed.getMonth() + 1).padStart(2, "0");
+    const dd = String(parsed.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  return fallbackIso;
+}
+
+function parseCompraNumber(value) {
+  if (value == null) return NaN;
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+
+  const raw = String(value || "").trim();
+  if (!raw) return NaN;
+
+  const cleaned = raw
+    .replace(/^r\$\s*/i, "")
+    .replace(/\s/g, "")
+    .replace(/\.(?=\d{3}(?:\D|$))/g, "")
+    .replace(",", ".");
+
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function formatCompraQuantidade(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "?";
+  return Number.isInteger(n) ? String(n) : String(n).replace(".", ",");
+}
+
+function mergeCompraDefaults(input = {}) {
+  const todayIso = getTodayIsoFortaleza();
+
+  return {
+    fornecedor: String(input.fornecedor || COMPRA_DEFAULTS.fornecedor).trim() || COMPRA_DEFAULTS.fornecedor,
+    situacao: String(input.situacao || COMPRA_DEFAULTS.situacao).trim() || COMPRA_DEFAULTS.situacao,
+    data_emissao: parseCompraDateToIso(input.data_emissao, todayIso),
+    vencimento: parseCompraDateToIso(input.vencimento, todayIso),
+    quitar_pagamento:
+      normalizeText(input.quitar_pagamento) === "nao" || normalizeText(input.quitar_pagamento) === "não"
+        ? "Não"
+        : "Sim",
+    conta_bancaria: String(input.conta_bancaria || COMPRA_DEFAULTS.conta_bancaria).trim() || COMPRA_DEFAULTS.conta_bancaria
+  };
+}
+
+function normalizeCompraExtraction(raw = {}) {
+  const itens = Array.isArray(raw?.itens) ? raw.itens : [];
+
+  return {
+    pedido_detectado: !!raw?.pedido_detectado,
+    observacoes: raw?.observacoes == null ? "" : String(raw.observacoes).trim(),
+    itens: itens
+      .map((item, idx) => {
+        const quantidade = parseCompraNumber(item?.quantidade);
+        const precoUnitario = parseCompraNumber(item?.preco_unitario_falado);
+        const valorTotal = parseCompraNumber(item?.valor_total_falado);
+
+        let quantidadeFinal = Number.isFinite(quantidade) && quantidade > 0 ? quantidade : 1;
+        let precoUnitarioFinal = Number.isFinite(precoUnitario) && precoUnitario > 0 ? precoUnitario : NaN;
+
+        if ((!Number.isFinite(precoUnitarioFinal) || precoUnitarioFinal <= 0) &&
+            Number.isFinite(valorTotal) && valorTotal > 0 && quantidadeFinal > 0) {
+          precoUnitarioFinal = valorTotal / quantidadeFinal;
+        }
+
+        return {
+          id_local: `C${idx + 1}`,
+          produto_falado: String(item?.produto_falado || "").trim(),
+          quantidade: quantidadeFinal,
+          unidade: String(item?.unidade || "un").trim() || "un",
+          preco_unitario_falado:
+            Number.isFinite(precoUnitarioFinal) && precoUnitarioFinal > 0
+              ? Number(precoUnitarioFinal.toFixed(2))
+              : null,
+          valor_total_falado:
+            Number.isFinite(valorTotal) && valorTotal > 0
+              ? Number(valorTotal.toFixed(2))
+              : null,
+          observacoes: String(item?.observacoes || "").trim()
+        };
+      })
+      .filter((item) => item.produto_falado)
+  };
+}
+
+async function extractCompraFromText(text) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY não configurada.");
+  }
+
+  const model = process.env.OPENAI_COMPRAS_TEXT_MODEL || "gpt-4.1";
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      pedido_detectado: { type: "boolean" },
+      observacoes: { type: ["string", "null"] },
+      itens: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            produto_falado: { type: ["string", "null"] },
+            quantidade: { type: ["number", "null"] },
+            unidade: { type: ["string", "null"] },
+            preco_unitario_falado: { type: ["number", "null"] },
+            valor_total_falado: { type: ["number", "null"] },
+            observacoes: { type: ["string", "null"] }
+          },
+          required: [
+            "produto_falado",
+            "quantidade",
+            "unidade",
+            "preco_unitario_falado",
+            "valor_total_falado",
+            "observacoes"
+          ]
+        }
+      }
+    },
+    required: ["pedido_detectado", "observacoes", "itens"]
+  };
+
+  const instructions = [
+    "Analise este texto de pedido de compra para fornecedor em português do Brasil.",
+    "Extraia os itens do pedido com o máximo de fidelidade.",
+    "Retorne SOMENTE JSON no schema fornecido.",
+    "Não invente itens nem preços.",
+    "Se o preço não estiver no texto, retorne null.",
+    "Se a quantidade não estiver explícita, assuma 1 somente quando o item estiver claro; caso contrário use null.",
+    "unidade deve ser 'un', 'kg', 'g' ou null.",
+    "Considere que o fornecedor padrão será CH - SP; não precisa inferir fornecedor.",
+    "observacoes pode trazer um resumo curto do contexto do pedido."
+  ].join("\n");
+
+  const payload = {
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: instructions },
+          { type: "input_text", text: `Texto do pedido:\n${String(text || "").trim()}` }
+        ]
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "compra_texto",
+        strict: true,
+        schema
+      }
+    }
+  };
+
+  const resp = await axios.post("https://api.openai.com/v1/responses", payload, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    timeout: 120000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity
+  });
+
+  const outputText = extractResponsesOutputText(resp.data || {});
+  const parsed = JSON.parse(outputText || "{}");
+  return normalizeCompraExtraction(parsed);
+}
+
+async function extractCompraFromImage(buffer, mimeType = "image/jpeg", filename = "pedido_compra.jpg", captionText = "") {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY não configurada.");
+  }
+
+  const model = process.env.OPENAI_COMPRAS_IMAGE_MODEL || "gpt-4.1";
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      pedido_detectado: { type: "boolean" },
+      observacoes: { type: ["string", "null"] },
+      itens: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            produto_falado: { type: ["string", "null"] },
+            quantidade: { type: ["number", "null"] },
+            unidade: { type: ["string", "null"] },
+            preco_unitario_falado: { type: ["number", "null"] },
+            valor_total_falado: { type: ["number", "null"] },
+            observacoes: { type: ["string", "null"] }
+          },
+          required: [
+            "produto_falado",
+            "quantidade",
+            "unidade",
+            "preco_unitario_falado",
+            "valor_total_falado",
+            "observacoes"
+          ]
+        }
+      }
+    },
+    required: ["pedido_detectado", "observacoes", "itens"]
+  };
+
+  const dataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
+  const instructions = [
+    "Analise esta imagem de conversa, print ou pedido enviado a fornecedor.",
+    "Extraia os itens de compra com o máximo de fidelidade visual.",
+    "Retorne SOMENTE JSON no schema fornecido.",
+    "Não invente produtos nem preços.",
+    "Se a imagem estiver parcial, extraia apenas o que estiver claro.",
+    "Se o preço não estiver visível, retorne null.",
+    "Se a quantidade não estiver explícita, assuma 1 apenas quando o item estiver claramente pedido.",
+    "unidade deve ser 'un', 'kg', 'g' ou null.",
+    "Considere que o fornecedor padrão será CH - SP; não precisa inferir fornecedor."
+  ].join("\n");
+
+  const content = [
+    { type: "input_text", text: instructions }
+  ];
+
+  if (String(captionText || "").trim()) {
+    content.push({
+      type: "input_text",
+      text: `Texto adicional enviado junto com a imagem:\n${String(captionText || "").trim()}`
+    });
+  }
+
+  content.push({
+    type: "input_image",
+    image_url: dataUrl
+  });
+
+  const payload = {
+    model,
+    input: [
+      {
+        role: "user",
+        content
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "compra_imagem",
+        strict: true,
+        schema
+      }
+    }
+  };
+
+  const resp = await axios.post("https://api.openai.com/v1/responses", payload, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    timeout: 180000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity
+  });
+
+  const outputText = extractResponsesOutputText(resp.data || {});
+  const parsed = JSON.parse(outputText || "{}");
+  return normalizeCompraExtraction(parsed);
+}
+
+function buildCompraPayload(extraction, overrides = {}) {
+  const defaults = mergeCompraDefaults(overrides.defaults || {});
+  const itens = Array.isArray(extraction?.itens) ? extraction.itens : [];
+
+  return {
+    defaults,
+    itens: itens.map((item, idx) => ({
+      id_local: item.id_local || `C${idx + 1}`,
+      produto_falado: item.produto_falado || "",
+      quantidade: Number(item.quantidade || 1),
+      preco_unitario_falado:
+        Number.isFinite(Number(item.preco_unitario_falado)) && Number(item.preco_unitario_falado) > 0
+          ? Number(item.preco_unitario_falado)
+          : null,
+      observacoes: item.observacoes || ""
+    }))
+  };
+}
+
+async function resolveProdutoCompraViaAppsScript(nomeFalado) {
+  try {
+    const resp = await callComprasWebApp({
+      action: "resolver_produto_compra",
+      nome_falado: nomeFalado
+    });
+
+    return resp;
+  } catch (err) {
+    console.error("Erro ao resolver produto de compra via Apps Script:", err?.message || err);
+    return {
+      ok: false,
+      encontrado: false,
+      produto_oficial: "",
+      preco_padrao: "",
+      message: String(err?.message || err || "Falha ao consultar Apps Script")
+    };
+  }
+}
+
+function summarizePendingCompras(lote) {
+  const defaults = lote?.defaults || mergeCompraDefaults();
+  const prontos = Array.isArray(lote?.itens_prontos) ? lote.itens_prontos : [];
+  const pendencias = Array.isArray(lote?.pendencias_associacao) ? lote.pendencias_associacao : [];
+
+  const linhas = [];
+  linhas.push("Compras identificadas.");
+  linhas.push("");
+  linhas.push(`Fornecedor: ${defaults.fornecedor}`);
+  linhas.push(`Situação: ${defaults.situacao}`);
+  linhas.push(`Emissão: ${formatIsoDateBr(defaults.data_emissao)}`);
+  linhas.push(`Vencimento: ${formatIsoDateBr(defaults.vencimento)}`);
+  linhas.push(`Quitar pagamento: ${defaults.quitar_pagamento}`);
+  linhas.push(`Conta bancária: ${defaults.conta_bancaria}`);
+  linhas.push("");
+  linhas.push(`Prontos: ${prontos.length}`);
+  linhas.push(`Pendências: ${pendencias.length}`);
+
+  if (prontos.length) {
+    linhas.push("", "Prontos:");
+    prontos.forEach((item) => {
+      linhas.push(
+        `${item.id_local}. ${item.produto_oficial || item.produto_falado || "?"} | qtd ${formatCompraQuantidade(item.quantidade)} | unit ${formatMoneyBRL(item.valor_unitario)} | total ${formatMoneyBRL(item.valor_total)}`
+      );
+    });
+  }
+
+  if (pendencias.length) {
+    linhas.push("", "Pendências:");
+    pendencias.forEach((item) => {
+      linhas.push(
+        `${item.id_local}. ${item.produto_oficial || item.produto_falado || "?"} | qtd ${formatCompraQuantidade(item.quantidade)} | ${item.erro || "pendência"}`
+      );
+    });
+  }
+
+  linhas.push("", "Comandos:");
+  linhas.push("- produto C1 NOME_DO_PRODUTO");
+  linhas.push("- preco C1 2290");
+  linhas.push("- qtd C1 2");
+  linhas.push("- fornecedor CH - SP");
+  linhas.push("- situacao Em São Paulo");
+  linhas.push("- emissao hoje");
+  linhas.push("- vencimento hoje");
+  linhas.push("- quitar sim");
+  linhas.push("- conta Itau");
+  linhas.push("- remover C1");
+  linhas.push("- confirmar compras");
+  linhas.push("- cancelar compras");
+  linhas.push("");
+  linhas.push("Exemplos:");
+  linhas.push("- produto C1 Cabelo Castanho Liga Rosa 60/65cm");
+  linhas.push("- preco C1 2290");
+  linhas.push("- fornecedor CH - SP");
+
+  return linhas.join("\n");
+}
+
+function findCompraItemByIdLocal(lote, idLocal) {
+  const target = String(idLocal || "").trim().toUpperCase();
+  if (!target) return null;
+
+  const prontos = Array.isArray(lote?.itens_prontos) ? lote.itens_prontos : [];
+  const pendencias = Array.isArray(lote?.pendencias_associacao) ? lote.pendencias_associacao : [];
+
+  let idx = prontos.findIndex((item) => String(item.id_local || "").toUpperCase() === target);
+  if (idx >= 0) {
+    return {
+      collection: "itens_prontos",
+      index: idx,
+      item: prontos[idx]
+    };
+  }
+
+  idx = pendencias.findIndex((item) => String(item.id_local || "").toUpperCase() === target);
+  if (idx >= 0) {
+    return {
+      collection: "pendencias_associacao",
+      index: idx,
+      item: pendencias[idx]
+    };
+  }
+
+  return null;
+}
+
+function buildCompraReadyItem(baseItem, overrides = {}) {
+  const quantidade = Number(overrides.quantidade ?? baseItem.quantidade ?? 1);
+  const valorUnitario = Number(overrides.valor_unitario ?? baseItem.valor_unitario ?? 0);
+
+  return {
+    id_local: baseItem.id_local,
+    produto_falado: overrides.produto_falado ?? baseItem.produto_falado ?? "",
+    produto_oficial: overrides.produto_oficial ?? baseItem.produto_oficial ?? "",
+    quantidade: Number.isFinite(quantidade) && quantidade > 0 ? quantidade : 1,
+    valor_unitario: Number.isFinite(valorUnitario) && valorUnitario > 0 ? Number(valorUnitario.toFixed(2)) : 0,
+    valor_total:
+      Number.isFinite(quantidade) && quantidade > 0 && Number.isFinite(valorUnitario) && valorUnitario > 0
+        ? Number((quantidade * valorUnitario).toFixed(2))
+        : 0,
+    persistir_preco: !!(overrides.persistir_preco ?? baseItem.persistir_preco),
+    observacoes: overrides.observacoes ?? baseItem.observacoes ?? ""
+  };
+}
+
+function upsertCompraPendencia(lote, pendingItem) {
+  const pendencias = Array.isArray(lote.pendencias_associacao) ? lote.pendencias_associacao : [];
+  const idx = pendencias.findIndex(
+    (item) => String(item.id_local || "").toUpperCase() === String(pendingItem.id_local || "").toUpperCase()
+  );
+
+  if (idx >= 0) {
+    pendencias[idx] = pendingItem;
+  } else {
+    pendencias.push(pendingItem);
+  }
+  lote.pendencias_associacao = pendencias;
+}
+
+function removeCompraPendingById(lote, idLocal) {
+  const pendencias = Array.isArray(lote.pendencias_associacao) ? lote.pendencias_associacao : [];
+  const idx = pendencias.findIndex(
+    (item) => String(item.id_local || "").toUpperCase() === String(idLocal || "").toUpperCase()
+  );
+  if (idx >= 0) pendencias.splice(idx, 1);
+}
+
+function upsertCompraReady(lote, readyItem) {
+  const prontos = Array.isArray(lote.itens_prontos) ? lote.itens_prontos : [];
+  const idx = prontos.findIndex(
+    (item) => String(item.id_local || "").toUpperCase() === String(readyItem.id_local || "").toUpperCase()
+  );
+
+  if (idx >= 0) {
+    prontos[idx] = readyItem;
+  } else {
+    prontos.push(readyItem);
+  }
+  lote.itens_prontos = prontos;
+  removeCompraPendingById(lote, readyItem.id_local);
+}
+
+function ensureCompraDefaultsObject(lote) {
+  lote.defaults = mergeCompraDefaults(lote.defaults || {});
+  return lote.defaults;
+}
+
+function parseCompraProdutoCommand(text) {
+  const raw = String(text || "").trim();
+
+  let m = raw.match(/^produto\s+(C\d+)\s+(.+)$/i);
+  if (m) {
+    return { itemId: String(m[1]).toUpperCase(), produto: String(m[2]).trim() };
+  }
+
+  m = raw.match(/^associar\s+(C\d+)\s+(?:a\s+)?(.+)$/i);
+  if (m) {
+    return { itemId: String(m[1]).toUpperCase(), produto: String(m[2]).trim() };
+  }
+
+  return null;
+}
+
+function parseCompraPrecoCommand(text) {
+  const raw = String(text || "").trim();
+  const m = raw.match(/^preco\s+(C\d+)\s+(.+)$/i);
+  if (!m) return null;
+
+  const preco = parseCompraNumber(m[2]);
+  if (!Number.isFinite(preco) || preco <= 0) return null;
+
+  return {
+    itemId: String(m[1]).toUpperCase(),
+    preco: Number(preco.toFixed(2))
+  };
+}
+
+function parseCompraQtdCommand(text) {
+  const raw = String(text || "").trim();
+  const m = raw.match(/^(?:qtd|quantidade)\s+(C\d+)\s+(.+)$/i);
+  if (!m) return null;
+
+  const qtd = parseCompraNumber(m[2]);
+  if (!Number.isFinite(qtd) || qtd <= 0) return null;
+
+  return {
+    itemId: String(m[1]).toUpperCase(),
+    quantidade: qtd
+  };
+}
+
+function parseCompraDefaultsCommand(text) {
+  const raw = String(text || "").trim();
+  let m = raw.match(/^fornecedor\s+(.+)$/i);
+  if (m) return { field: "fornecedor", value: String(m[1]).trim() };
+
+  m = raw.match(/^situa(?:cao|ção)\s+(.+)$/i);
+  if (m) return { field: "situacao", value: String(m[1]).trim() };
+
+  m = raw.match(/^emis(?:sao|são)\s+(.+)$/i);
+  if (m) return { field: "data_emissao", value: String(m[1]).trim() };
+
+  m = raw.match(/^vencimento\s+(.+)$/i);
+  if (m) return { field: "vencimento", value: String(m[1]).trim() };
+
+  m = raw.match(/^conta\s+(.+)$/i);
+  if (m) return { field: "conta_bancaria", value: String(m[1]).trim() };
+
+  m = raw.match(/^quitar\s+(.+)$/i);
+  if (m) return { field: "quitar_pagamento", value: String(m[1]).trim() };
+
+  return null;
+}
+
+function parseRemoverCompraCommand(text) {
+  const raw = String(text || "").trim();
+  let m = raw.match(/^remover\s+(C\d+)[.!?]?$/i);
+  if (m) {
+    return { itemId: String(m[1]).toUpperCase(), itemNumero: null };
+  }
+
+  m = raw.match(/^remover\s+(\d+)[.!?]?$/i);
+  if (m) {
+    return { itemId: null, itemNumero: Number(m[1]) };
+  }
+
+  return null;
+}
+
+function isConfirmarComprasCommand(text) {
+  const t = normalizeText(String(text || "").replace(/[.!?]+$/g, ""));
+  return t === "confirmar compras" || t === "confirmar lote" || t === "confirmar";
+}
+
+function isCancelarComprasCommand(text) {
+  const t = normalizeText(String(text || "").replace(/[.!?]+$/g, ""));
+  return t === "cancelar compras" || t === "cancelar lote" || t === "cancelar";
+}
+
+async function tryHandleComprasPendingCommands(chatId, text) {
+  const lote = getPendingCompras(chatId);
+  if (!lote) return false;
+
+  ensureCompraDefaultsObject(lote);
+
+  const produtoCmd = parseCompraProdutoCommand(text);
+  if (produtoCmd) {
+    const loc = findCompraItemByIdLocal(lote, produtoCmd.itemId);
+    if (!loc) {
+      await sendTelegramMessage(chatId, `Não encontrei o item ${produtoCmd.itemId}.`);
+      return true;
+    }
+
+    const resolved = await resolveProdutoCompraViaAppsScript(produtoCmd.produto);
+    if (!resolved?.ok || !resolved?.produto_oficial) {
+      await sendTelegramMessage(chatId, resolved?.message || "Não consegui resolver esse produto no GC.");
+      return true;
+    }
+
+    const precoPadrao = parseCompraNumber(resolved.preco_padrao);
+
+    if (loc.collection === "itens_prontos") {
+      const atual = lote.itens_prontos[loc.index];
+      lote.itens_prontos[loc.index] = buildCompraReadyItem(atual, {
+        produto_oficial: resolved.produto_oficial,
+        produto_falado: produtoCmd.produto,
+        valor_unitario:
+          Number.isFinite(parseCompraNumber(atual.valor_unitario)) && parseCompraNumber(atual.valor_unitario) > 0
+            ? Number(atual.valor_unitario)
+            : (Number.isFinite(precoPadrao) && precoPadrao > 0 ? precoPadrao : Number(atual.valor_unitario || 0))
+      });
+    } else {
+      const atual = lote.pendencias_associacao[loc.index];
+      const precoAtual = parseCompraNumber(atual.valor_unitario);
+      const precoFinal =
+        Number.isFinite(precoAtual) && precoAtual > 0
+          ? precoAtual
+          : (Number.isFinite(precoPadrao) && precoPadrao > 0 ? precoPadrao : NaN);
+
+      if (Number.isFinite(precoFinal) && precoFinal > 0) {
+        upsertCompraReady(lote, buildCompraReadyItem(atual, {
+          produto_oficial: resolved.produto_oficial,
+          produto_falado: produtoCmd.produto,
+          valor_unitario: precoFinal
+        }));
+      } else {
+        lote.pendencias_associacao[loc.index] = {
+          ...atual,
+          produto_falado: produtoCmd.produto,
+          produto_oficial: resolved.produto_oficial,
+          erro: `Preço não encontrado no MAPA_COMPRAS para "${resolved.produto_oficial}".`
+        };
+      }
+    }
+
+    lote.historico_comandos.push({
+      tipo: "produto",
+      item_id: produtoCmd.itemId,
+      produto: resolved.produto_oficial,
+      em: new Date().toISOString()
+    });
+
+    savePendingCompras(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingCompras(lote));
+    return true;
+  }
+
+  const precoCmd = parseCompraPrecoCommand(text);
+  if (precoCmd) {
+    const loc = findCompraItemByIdLocal(lote, precoCmd.itemId);
+    if (!loc) {
+      await sendTelegramMessage(chatId, `Não encontrei o item ${precoCmd.itemId}.`);
+      return true;
+    }
+
+    if (loc.collection === "itens_prontos") {
+      const atual = lote.itens_prontos[loc.index];
+      lote.itens_prontos[loc.index] = buildCompraReadyItem(atual, {
+        valor_unitario: precoCmd.preco,
+        persistir_preco: true
+      });
+    } else {
+      const atual = lote.pendencias_associacao[loc.index];
+      if (atual.produto_oficial) {
+        upsertCompraReady(lote, buildCompraReadyItem(atual, {
+          valor_unitario: precoCmd.preco,
+          persistir_preco: true
+        }));
+      } else {
+        lote.pendencias_associacao[loc.index] = {
+          ...atual,
+          valor_unitario: precoCmd.preco,
+          persistir_preco: true,
+          erro: atual.erro || "Produto ainda não resolvido."
+        };
+      }
+    }
+
+    lote.historico_comandos.push({
+      tipo: "preco",
+      item_id: precoCmd.itemId,
+      preco: precoCmd.preco,
+      em: new Date().toISOString()
+    });
+
+    savePendingCompras(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingCompras(lote));
+    return true;
+  }
+
+  const qtdCmd = parseCompraQtdCommand(text);
+  if (qtdCmd) {
+    const loc = findCompraItemByIdLocal(lote, qtdCmd.itemId);
+    if (!loc) {
+      await sendTelegramMessage(chatId, `Não encontrei o item ${qtdCmd.itemId}.`);
+      return true;
+    }
+
+    if (loc.collection === "itens_prontos") {
+      const atual = lote.itens_prontos[loc.index];
+      lote.itens_prontos[loc.index] = buildCompraReadyItem(atual, {
+        quantidade: qtdCmd.quantidade
+      });
+    } else {
+      const atual = lote.pendencias_associacao[loc.index];
+      lote.pendencias_associacao[loc.index] = {
+        ...atual,
+        quantidade: qtdCmd.quantidade
+      };
+    }
+
+    lote.historico_comandos.push({
+      tipo: "quantidade",
+      item_id: qtdCmd.itemId,
+      quantidade: qtdCmd.quantidade,
+      em: new Date().toISOString()
+    });
+
+    savePendingCompras(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingCompras(lote));
+    return true;
+  }
+
+  const defaultsCmd = parseCompraDefaultsCommand(text);
+  if (defaultsCmd) {
+    const defaults = ensureCompraDefaultsObject(lote);
+
+    if (defaultsCmd.field === "data_emissao" || defaultsCmd.field === "vencimento") {
+      defaults[defaultsCmd.field] = parseCompraDateToIso(defaultsCmd.value, defaults[defaultsCmd.field]);
+    } else if (defaultsCmd.field === "quitar_pagamento") {
+      defaults[defaultsCmd.field] =
+        ["nao", "não", "n", "false", "0"].includes(normalizeText(defaultsCmd.value)) ? "Não" : "Sim";
+    } else {
+      defaults[defaultsCmd.field] = defaultsCmd.value;
+    }
+
+    lote.historico_comandos.push({
+      tipo: "default",
+      campo: defaultsCmd.field,
+      valor: defaults[defaultsCmd.field],
+      em: new Date().toISOString()
+    });
+
+    savePendingCompras(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingCompras(lote));
+    return true;
+  }
+
+  const removerCmd = parseRemoverCompraCommand(text);
+  if (removerCmd) {
+    if (removerCmd.itemId) {
+      const loc = findCompraItemByIdLocal(lote, removerCmd.itemId);
+      if (!loc) {
+        await sendTelegramMessage(chatId, `Não encontrei o item ${removerCmd.itemId}.`);
+        return true;
+      }
+
+      lote[loc.collection].splice(loc.index, 1);
+    } else {
+      const idx = Number(removerCmd.itemNumero || 0) - 1;
+      if (idx < 0 || idx >= (lote.itens_prontos || []).length) {
+        await sendTelegramMessage(chatId, `Não encontrei o item ${removerCmd.itemNumero}.`);
+        return true;
+      }
+
+      lote.itens_prontos.splice(idx, 1);
+    }
+
+    lote.historico_comandos.push({
+      tipo: "remocao",
+      item: removerCmd.itemId || removerCmd.itemNumero,
+      em: new Date().toISOString()
+    });
+
+    savePendingCompras(chatId, lote);
+    await sendTelegramMessage(chatId, summarizePendingCompras(lote));
+    return true;
+  }
+
+  if (isCancelarComprasCommand(text)) {
+    clearPendingCompras(chatId);
+    await sendTelegramMessage(chatId, "Lote de compras cancelado.");
+    return true;
+  }
+
+  if (isConfirmarComprasCommand(text)) {
+    if ((lote.pendencias_associacao || []).length > 0) {
+      await sendTelegramMessage(
+        chatId,
+        "Ainda existem pendências no lote de compras. Resolva antes de confirmar."
+      );
+      return true;
+    }
+
+    const result = await callComprasWebApp({
+      action: "confirmar_lote_compras",
+      defaults: lote.defaults,
+      itens: lote.itens_prontos || []
+    });
+
+    console.log("Compras confirmar result:", JSON.stringify(result));
+
+    if (!result?.ok) {
+      await sendTelegramMessage(
+        chatId,
+        result?.message || "Não consegui confirmar o lote de compras."
+      );
+      return true;
+    }
+
+    clearPendingCompras(chatId);
+    await sendTelegramMessage(chatId, result?.message || "Lote de compras confirmado.");
+    return true;
+  }
+
+  return false;
+}
+
+async function handleComprasMessage(ctx) {
+  const {
+    message,
+    text = "",
+    transcription = "",
+    sendTelegramMessage,
+    imageBuffer = null,
+    imageMimeType = "",
+    imageFileName = ""
+  } = ctx;
+
+  const chatId = message.chat.id;
+  const rawText = String(text || "").trim();
+  const parsed = parseComprasIntent(rawText, message);
+  const origemDetectada = imageBuffer ? "imagem" : (parsed.origem || "texto");
+
+  if (transcription) {
+    await sendTelegramMessage(chatId, `Transcrição:\n"${transcription}"`);
+  }
+
+  let extraction;
+  try {
+    extraction = imageBuffer
+      ? await extractCompraFromImage(
+          imageBuffer,
+          imageMimeType || "image/jpeg",
+          imageFileName || "pedido_compra.jpg",
+          rawText
+        )
+      : await extractCompraFromText(rawText);
+  } catch (err) {
+    console.error("Erro ao extrair compra com IA:", err?.message || err);
+    await sendTelegramMessage(
+      chatId,
+      "Não consegui interpretar esse pedido de compra com segurança ainda."
+    );
+    return;
+  }
+
+  if (!Array.isArray(extraction?.itens) || !extraction.itens.length) {
+    await sendTelegramMessage(
+      chatId,
+      imageBuffer
+        ? "Não consegui identificar itens de compra nesse print. Se quiser, mande o pedido em texto também."
+        : "Não consegui identificar itens de compra com segurança nesse texto."
+    );
+    return;
+  }
+
+  const compraPayload = buildCompraPayload(extraction, {
+    defaults: {
+      fornecedor: COMPRA_DEFAULTS.fornecedor,
+      situacao: COMPRA_DEFAULTS.situacao,
+      data_emissao: getTodayIsoFortaleza(),
+      vencimento: getTodayIsoFortaleza(),
+      quitar_pagamento: COMPRA_DEFAULTS.quitar_pagamento,
+      conta_bancaria: COMPRA_DEFAULTS.conta_bancaria
+    }
+  });
+
+  const result = await callComprasWebApp({
+    action: "processar_compras_v1",
+    origem: origemDetectada,
+    compra: compraPayload,
+    telegram: {
+      chat_id: chatId
+    },
+    message_meta: {
+      message_id: message.message_id || null,
+      date: message.date || null
+    }
+  });
+
+  console.log("Compras result:", JSON.stringify(result));
+
+  if (!result?.ok) {
+    await sendTelegramMessage(
+      chatId,
+      result?.message || "Não consegui montar a prévia das compras."
+    );
+    return;
+  }
+
+  const lote = {
+    tipo: "compras_lote_pendente",
+    origem: result.origem || origemDetectada,
+    defaults: mergeCompraDefaults(result.defaults || {}),
+    itens_prontos: result.itens_prontos || [],
+    pendencias_associacao: result.pendencias_associacao || [],
+    historico_comandos: [],
+    criadoEm: new Date().toISOString()
+  };
+
+  savePendingCompras(chatId, lote);
+  await sendTelegramMessage(chatId, summarizePendingCompras(lote));
+}
+
+/**
+ * =========================================================
  * VENDAS - CÓDIGO ATUAL
  * =========================================================
  */
@@ -2719,11 +3714,29 @@ app.post("/telegram/webhook", async (req, res) => {
     if (msg.document) {
       const explicitRecebimentosIntentInCaption = !!text && isRecebimentosIntent(text, msg);
       const explicitPagamentosIntentInCaption = !!text && isPagamentosIntent(text, msg);
+      const explicitComprasIntentInCaption = !!text && isComprasIntent(text, msg);
+
+      if (looksLikeImageDocument(msg)) {
+        const fileInfo = await getTelegramFile(msg.document.file_id);
+        const imageBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+
+        await handleComprasMessage({
+          message: msg,
+          text,
+          sendTelegramMessage,
+          imageBuffer,
+          imageMimeType: msg.document.mime_type || "image/jpeg",
+          imageFileName: msg.document.file_name || "pedido_compra.jpg"
+        });
+        return;
+      }
 
       if (!looksLikePdfDocument(msg)) {
         await sendTelegramMessage(
           chatId,
-          "Recebi um arquivo. Se isso for um extrato de recebimentos, envie em PDF."
+          explicitComprasIntentInCaption
+            ? "Recebi um arquivo, mas para compras eu preciso que ele seja uma imagem legível do pedido."
+            : "Recebi um arquivo. Se isso for um extrato de recebimentos, envie em PDF."
         );
         return;
       }
@@ -2860,6 +3873,25 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     // =====================================================
+    // FOTO / PRINT DE PEDIDO
+    // =====================================================
+    if (Array.isArray(msg.photo) && msg.photo.length) {
+      const biggestPhoto = msg.photo[msg.photo.length - 1];
+      const fileInfo = await getTelegramFile(biggestPhoto.file_id);
+      const imageBuffer = await downloadTelegramFileBuffer(fileInfo.file_path);
+
+      await handleComprasMessage({
+        message: msg,
+        text,
+        sendTelegramMessage,
+        imageBuffer,
+        imageMimeType: "image/jpeg",
+        imageFileName: `telegram_photo_${msg.message_id || "pedido"}.jpg`
+      });
+      return;
+    }
+
+    // =====================================================
     // ÁUDIO
     // =====================================================
     if (msg.voice || msg.audio) {
@@ -2883,6 +3915,9 @@ app.post("/telegram/webhook", async (req, res) => {
 
       const handledPagamentosPending = await tryHandlePagamentosPendingCommands(chatId, transcription);
       if (handledPagamentosPending) return;
+
+      const handledComprasPending = await tryHandleComprasPendingCommands(chatId, transcription);
+      if (handledComprasPending) return;
 
       if (isPagamentosIntent(transcription, msg)) {
         await handlePagamentosMessage({
@@ -2948,6 +3983,16 @@ app.post("/telegram/webhook", async (req, res) => {
         return;
       }
 
+      if (isComprasIntent(transcription, msg)) {
+        await handleComprasMessage({
+          message: msg,
+          text: transcription,
+          transcription,
+          sendTelegramMessage
+        });
+        return;
+      }
+
       const handledSalesPending = await tryHandlePendingSalesCommands(chatId, transcription);
       if (handledSalesPending) return;
 
@@ -2977,6 +4022,9 @@ app.post("/telegram/webhook", async (req, res) => {
 
       const handledPagamentosPending = await tryHandlePagamentosPendingCommands(chatId, text);
       if (handledPagamentosPending) return;
+
+      const handledComprasPending = await tryHandleComprasPendingCommands(chatId, text);
+      if (handledComprasPending) return;
 
       if (isPagamentosIntent(text, msg)) {
         await handlePagamentosMessage({
@@ -3034,6 +4082,15 @@ app.post("/telegram/webhook", async (req, res) => {
           sendTelegramMessage,
           documentText: lastPdf?.documentText || "",
           documentJson: lastPdf?.documentJson || null
+        });
+        return;
+      }
+
+      if (isComprasIntent(text, msg)) {
+        await handleComprasMessage({
+          message: msg,
+          text,
+          sendTelegramMessage
         });
         return;
       }

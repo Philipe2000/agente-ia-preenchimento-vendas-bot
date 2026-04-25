@@ -16,6 +16,11 @@ function doPost(e) {
       return jsonOutput_(result);
     }
 
+    if (action === "processar_compras_v1") {
+      const result = processarComprasV1_(body);
+      return jsonOutput_(result);
+    }
+
     if (action === "associar_pendencia_recebimentos") {
       const result = associarPendenciaRecebimentos_(body);
       return jsonOutput_(result);
@@ -33,6 +38,11 @@ function doPost(e) {
 
     if (action === "confirmar_lote_pagamentos") {
       const result = confirmarLotePagamentos_(body);
+      return jsonOutput_(result);
+    }
+
+    if (action === "confirmar_lote_compras") {
+      const result = confirmarLoteCompras_(body);
       return jsonOutput_(result);
     }
 
@@ -56,8 +66,18 @@ function doPost(e) {
       return jsonOutput_(result);
     }
 
+    if (action === "resolver_produto_compra") {
+      const result = resolverProdutoCompraAction_(body);
+      return jsonOutput_(result);
+    }
+
     if (action === "garantir_mapa_pagamentos") {
       const result = garantirInfraPagamentos_();
+      return jsonOutput_(result);
+    }
+
+    if (action === "garantir_mapa_compras") {
+      const result = garantirInfraCompras_();
       return jsonOutput_(result);
     }
 
