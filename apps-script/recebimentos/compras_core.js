@@ -2,6 +2,8 @@ const COMPRAS_SHEET_NAME_ = "Central de Controle API";
 const MAPA_COMPRAS_SHEET_NAME_ = "MAPA_COMPRAS";
 const COMPRAS_BASE_ROWS_ = [130, 137, 144, 151, 158];
 const COMPRAS_LINES_PER_REG_ = 6;
+const COMPRA_OPENAI_MODEL_ = "gpt-4.1";
+const COMPRA_AI_CACHE_PREFIX_ = "COMPRA_AI_RESOLVE_V1__";
 
 const COMPRA_DEFAULTS_ = {
   fornecedor: "CH - SP",
@@ -189,6 +191,161 @@ function comprasDefaultPriceSeeds_() {
   };
 }
 
+function comprasExtrairTextoOpenAI_(js) {
+  if (js && js.output_text) return String(js.output_text).trim();
+
+  if (Array.isArray(js && js.output)) {
+    for (var i = 0; i < js.output.length; i++) {
+      var item = js.output[i];
+      if (!item || !Array.isArray(item.content)) continue;
+      for (var j = 0; j < item.content.length; j++) {
+        var c = item.content[j];
+        if (c && c.type === "output_text" && c.text) {
+          return String(c.text).trim();
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
+function comprasResolverProdutoComIA_(produtoFalado, mapa, ranked) {
+  const nomeFalado = String(produtoFalado || "").trim();
+  if (!nomeFalado || !Array.isArray(mapa) || !mapa.length) {
+    return { ok: false, motivo: "Sem contexto suficiente para IA." };
+  }
+
+  const cache = CacheService.getScriptCache();
+  const cacheKey = COMPRA_AI_CACHE_PREFIX_ + comprasNorm_(nomeFalado);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {}
+  }
+
+  const apiKey = getScriptPropOrThrowInter_("OPENAI_API_KEY");
+  const candidatosBase = Array.isArray(ranked) && ranked.length
+    ? ranked.slice(0, 25).map(function(item) { return item.entry; })
+    : mapa.slice(0, 25);
+
+  const candidatos = candidatosBase.map(function(item, idx) {
+    return {
+      indice: idx + 1,
+      produto_gc: item.produto_gc,
+      preco_padrao: comprasParseNumber_(item.preco_padrao)
+    };
+  });
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      encontrado: { type: "boolean" },
+      produto_oficial: { type: ["string", "null"] },
+      confianca: { type: ["number", "null"] },
+      observacoes: { type: ["string", "null"] }
+    },
+    required: ["encontrado", "produto_oficial", "confianca", "observacoes"]
+  };
+
+  const prompt = [
+    "Resolva um nome livre de produto de compras para um produto oficial do GC.",
+    "Você deve escolher SOMENTE entre os candidatos fornecidos.",
+    "Considere sinônimos, abreviações, nomes incompletos, e faixas implícitas de comprimento.",
+    "Exemplos úteis:",
+    "- 'Castanho Liga Rosa 65' geralmente corresponde a '60/65cm'.",
+    "- 'Castanho Liga Rosa 55' geralmente corresponde a '50/55cm'.",
+    "- 'Castanho Liga Rosa 75' geralmente corresponde a '70/75cm'.",
+    "- Se houver dúvida real, marque encontrado = false.",
+    "Retorne apenas JSON válido no schema."
+  ].join("\n");
+
+  const payload = {
+    model: COMPRA_OPENAI_MODEL_,
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          {
+            type: "input_text",
+            text:
+              "Produto falado:\n" + nomeFalado +
+              "\n\nCandidatos:\n" +
+              JSON.stringify(candidatos, null, 2)
+          }
+        ]
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "compra_resolucao_produto",
+        strict: true,
+        schema: schema
+      }
+    }
+  };
+
+  const resp = UrlFetchApp.fetch("https://api.openai.com/v1/responses", {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      Authorization: "Bearer " + apiKey
+    },
+    muteHttpExceptions: true,
+    payload: JSON.stringify(payload)
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText() || "";
+  if (code < 200 || code >= 300) {
+    throw new Error("OpenAI HTTP " + code + " ao resolver produto de compra: " + body);
+  }
+
+  const js = JSON.parse(body);
+  const texto = comprasExtrairTextoOpenAI_(js);
+  if (!texto) {
+    throw new Error("A OpenAI respondeu sem texto utilizável na resolução de produto de compra.");
+  }
+
+  var parsed;
+  try {
+    parsed = JSON.parse(texto);
+  } catch (e) {
+    throw new Error("Resposta da OpenAI inválida na resolução de compra: " + texto);
+  }
+
+  const produtoOficial = String(parsed && parsed.produto_oficial || "").trim();
+  const confianca = Number(parsed && parsed.confianca);
+  const found = !!(parsed && parsed.encontrado && produtoOficial);
+
+  const escolhido = candidatosBase.find(function(item) {
+    return comprasNorm_(item.produto_gc) === comprasNorm_(produtoOficial);
+  });
+
+  const out = found && escolhido && isFinite(confianca) && confianca >= 0.72
+    ? {
+        ok: true,
+        produto_oficial: escolhido.produto_gc,
+        preco_padrao: comprasParseNumber_(escolhido.preco_padrao),
+        origem_preco: escolhido.origem_preco || "",
+        confianca: confianca,
+        via_ia: true
+      }
+    : {
+        ok: false,
+        motivo:
+          (parsed && parsed.observacoes) ||
+          ('Produto não resolvido para "' + nomeFalado + '" pela IA.')
+      };
+
+  cache.put(cacheKey, JSON.stringify(out), 21600);
+  return out;
+}
+
 function garantirInfraCompras_() {
   const ss = comprasGetSpreadsheet_();
   let sh = ss.getSheetByName(MAPA_COMPRAS_SHEET_NAME_);
@@ -359,16 +516,22 @@ function resolverProdutoCompra_(produtoFalado) {
     };
   }
 
-  let best = null;
-  let bestScore = 0;
+  var ranked = [];
 
   mapa.forEach(function(item) {
     const score = comprasScoreProduto_(falado, item.produto_gc);
-    if (score > bestScore) {
-      best = item;
-      bestScore = score;
-    }
+    ranked.push({
+      entry: item,
+      score: score
+    });
   });
+
+  ranked.sort(function(a, b) {
+    return b.score - a.score;
+  });
+
+  const best = ranked.length ? ranked[0].entry : null;
+  const bestScore = ranked.length ? ranked[0].score : 0;
 
   if (best && bestScore >= 0.56) {
     return {
@@ -378,6 +541,15 @@ function resolverProdutoCompra_(produtoFalado) {
       origem_preco: best.origem_preco || "",
       confianca: bestScore
     };
+  }
+
+  try {
+    const iaResolved = comprasResolverProdutoComIA_(falado, mapa, ranked);
+    if (iaResolved && iaResolved.ok) {
+      return iaResolved;
+    }
+  } catch (e) {
+    Logger.log("Compras IA resolver produto falhou: " + (e && e.message || e));
   }
 
   return {
