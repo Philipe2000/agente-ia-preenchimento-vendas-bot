@@ -779,6 +779,7 @@ function confirmarLoteCompras_(payload) {
     sh.getRange("D" + row).setValue(item.produto_oficial || item.produto_falado || "");
     sh.getRange("G" + row).setValue(Number(item.quantidade || 1));
     sh.getRange("I" + row).setValue(Number(item.valor_unitario || 0));
+    sh.getRange("K" + row).setFormulaR1C1("=RC[-4]*RC[-2]");
 
     if (Number(item.valor_unitario || 0) > 0) {
       comprasSalvarPrecoMapa_(
